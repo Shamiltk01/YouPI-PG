@@ -12,9 +12,9 @@
 | `HELP_PORTAL_PORT` | `3000` | Host port for the Customer Payment Help Portal |
 | `GMAIL_OBSERVER_PORT` | `6003` | Host port for the Gmail Polling Service & OAuth Callback |
 | `SMS_OBSERVER_PORT` | `6002` | Host port for the Google Messages / SMS Web Automator |
-| `DATABASE_URL` | `postgresql://...` | PostgreSQL connection URL |
-| `USE_SQLITE_FALLBACK` | `true` | When true, uses embedded SQLite if PostgreSQL is unreachable |
-| `SQLITE_DB_PATH` | `./data/youpi_pg.sqlite`| Path to local SQLite database file |
+| `DATABASE_URL` | unset locally | When set, connect to Layerbase hosted SQLite using its PostgreSQL-wire URL (`sslmode=verify-full`). Required on Vercel; without it Vercel startup fails rather than using ephemeral SQLite |
+| `DATABASE_POOL_MAX` | `5` | Maximum PostgreSQL-wire client pool size for Layerbase connections |
+| `SQLITE_DB_PATH` | `./data/youpi_pg.sqlite` | Path to the local SQLite database used when `DATABASE_URL` is unset |
 | `ENCRYPTION_MASTER_KEY` | `64-hex chars` | 256-bit key for encrypting OAuth credentials and device keys |
 | `JWT_SECRET` | `32+ chars` | Secret key for customer and admin session tokens |
 | `PAYMENT_ACTIVE_WINDOW_MS` | `300000` | Duration of active payment slot (5 minutes = 300,000ms) |

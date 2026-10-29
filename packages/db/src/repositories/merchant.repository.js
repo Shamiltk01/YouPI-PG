@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { encryptAtRest, decryptAtRest, safeEqual } from '@youpi/common';
+import { mapMaybe } from '../maybe.js';
 
 const API_KEY_SALT = 'youpi_merchant_api_key_salt_v1';
 
@@ -71,7 +72,7 @@ export class MerchantRepository {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    this.db.execute(sql, [
+    return mapMaybe(this.db.execute(sql, [
       id,
       data.businessName,
       data.slug,
@@ -84,36 +85,29 @@ export class MerchantRepository {
       branding,
       now,
       now
-    ]);
-
-    return this.findById(id);
+    ]), () => this.findById(id));
   }
 
   findById(id) {
-    const row = this.db.queryOne('SELECT * FROM merchants WHERE id = ?', [id]);
-    if (!row) return null;
-    return this.mapRow(row);
+    return mapMaybe(this.db.queryOne('SELECT * FROM merchants WHERE id = ?', [id]), row => row ? this.mapRow(row) : null);
   }
 
   findBySlug(slug) {
-    const row = this.db.queryOne('SELECT * FROM merchants WHERE slug = ?', [slug]);
-    if (!row) return null;
-    return this.mapRow(row);
+    return mapMaybe(this.db.queryOne('SELECT * FROM merchants WHERE slug = ?', [slug]), row => row ? this.mapRow(row) : null);
   }
 
   getDefault() {
-    const canonical = this.findById('00000000-0000-0000-0000-000000000001');
-    if (canonical) return canonical;
-    const all = this.findAll();
-    return all[0] || null;
+    return mapMaybe(this.findById('00000000-0000-0000-0000-000000000001'), canonical => {
+      if (canonical) return canonical;
+      return mapMaybe(this.findAll(), all => all[0] || null);
+    });
   }
 
   findAll() {
-    const rows = this.db.query(`
+    return mapMaybe(this.db.query(`
       SELECT * FROM merchants 
       ORDER BY CASE WHEN id = '00000000-0000-0000-0000-000000000001' THEN 0 ELSE 1 END, created_at ASC
-    `);
-    return rows.map(r => this.mapRow(r));
+    `), rows => rows.map(r => this.mapRow(r)));
   }
 
   update(id, updates) {
@@ -162,9 +156,7 @@ export class MerchantRepository {
     params.push(new Date().toISOString());
 
     params.push(id);
-    this.db.execute(`UPDATE merchants SET ${fields.join(', ')} WHERE id = ?`, params);
-
-    return this.findById(id);
+    return mapMaybe(this.db.execute(`UPDATE merchants SET ${fields.join(', ')} WHERE id = ?`, params), () => this.findById(id));
   }
 
   /**
@@ -191,21 +183,21 @@ export class MerchantRepository {
    * Generates and persists a new Merchant API Key (`mk_live_<48_hex_chars>`) for the merchant.
    */
   rotateApiKey(id) {
-    const merchant = this.findById(id);
-    if (!merchant) return null;
-    const newApiKey = `mk_live_${crypto.randomBytes(24).toString('hex')}`;
-    const updatedBranding = {
-      ...(merchant.branding || {}),
-      merchantApiKey: newApiKey
-    };
-    const updated = this.update(id, {
-      apiKey: newApiKey,
-      branding: updatedBranding
+    return mapMaybe(this.findById(id), merchant => {
+      if (!merchant) return null;
+      const newApiKey = `mk_live_${crypto.randomBytes(24).toString('hex')}`;
+      const updatedBranding = {
+        ...(merchant.branding || {}),
+        merchantApiKey: newApiKey
+      };
+      return mapMaybe(this.update(id, {
+        apiKey: newApiKey,
+        branding: updatedBranding
+      }), updated => ({
+        ...updated,
+        merchantKey: newApiKey
+      }));
     });
-    return {
-      ...updated,
-      merchantKey: newApiKey
-    };
   }
 
   mapRow(row) {

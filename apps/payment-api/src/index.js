@@ -19,7 +19,9 @@ if (!process.env.BASE_CHECKOUT_URL && typeof process.loadEnvFile === 'function')
 }
 import {
   getDatabase,
+  runMaybe,
   ensureDatabaseInitialized,
+  initializeLayerbaseDatabase,
   runMigrations,
   MerchantRepository,
   ReceivingAccountRepository,
@@ -51,10 +53,15 @@ import { registerDeviceRoutes } from './routes/device.routes.js';
 import { getWhatsAppBerryService, WhatsAppBerryService } from './services/whatsapp-berry.service.js';
 import { ObserverPollerService } from './services/observer-poller.service.js';
 
-export function createPaymentApp(customDb = null, options = {}) {
+export async function createPaymentApp(customDb = null, options = {}) {
   const db = customDb || getDatabase();
-  ensureDatabaseInitialized(db);
-  const { defaultMerchant } = runMigrations(db);
+  let defaultMerchant;
+  if (db.isLayerbase) {
+    ({ defaultMerchant } = await initializeLayerbaseDatabase(db));
+  } else {
+    ensureDatabaseInitialized(db);
+    ({ defaultMerchant } = runMigrations(db));
+  }
   const isCustom = !!customDb;
   const whatsappBerryService = options.whatsappBerryService || (isCustom ? new WhatsAppBerryService({
     sessionId: 'test_berry_session',
@@ -157,26 +164,33 @@ export function createPaymentApp(customDb = null, options = {}) {
   // BULLETPROOF QUEUE PROMOTION HANDLER
   function handleSlotFreedAndPromote(receivingAccountId) {
     if (!receivingAccountId) return null;
-    const promoted = queueEngine.promoteNext(receivingAccountId);
-    if (promoted) {
-      if (promoted.expiresAt) {
-        timingEngine.startActiveTimer(promoted.id, promoted.expiresAt);
+    return runMaybe(function* () {
+      const promoted = yield queueEngine.promoteNext(receivingAccountId);
+      if (promoted) {
+        if (promoted.expiresAt) yield timingEngine.startActiveTimer(promoted.id, promoted.expiresAt);
+        server.broadcastSse(promoted.id, 'status_change', {
+          status: PaymentStatus.ACTIVE,
+          queuePosition: 0,
+          expiresAt: promoted.expiresAt
+        });
+        server.broadcastSse(`queue_${receivingAccountId}`, 'queue_update', {
+          promotedId: promoted.id
+        });
       }
-      server.broadcastSse(promoted.id, 'status_change', {
-        status: PaymentStatus.ACTIVE,
-        queuePosition: 0,
-        expiresAt: promoted.expiresAt
-      });
-      server.broadcastSse(`queue_${receivingAccountId}`, 'queue_update', {
-        promotedId: promoted.id
-      });
-    }
-    return promoted;
+      return promoted;
+    });
+  }
+
+  function runBackground(generatorFactory, operation) {
+    Promise.resolve(runMaybe(generatorFactory)).catch(err => {
+      console.error(`[Payment API] ${operation} failed:`, err.message);
+    });
   }
 
   eventEmitter.on('PAYMENT.OBSERVED_SUCCESS', (data) => {
-    const session = sessionRepo.findById(data.paymentId);
-    if (session) {
+    runBackground(function* () {
+      const session = yield sessionRepo.findById(data.paymentId);
+      if (!session) return;
       server.broadcastSse(session.id, 'status_change', {
         status: PaymentStatus.OBSERVED_SUCCESS,
         settlementState: 'NOT_RECONCILED',
@@ -184,49 +198,52 @@ export function createPaymentApp(customDb = null, options = {}) {
         verificationTag: data.verificationTag || session.verificationTag,
         sources: data.sources || session.verificationSources
       });
-      webhookEngine.dispatch('OBSERVED_SUCCESS', session).catch(() => {});
-      handleSlotFreedAndPromote(session.receivingAccountId);
-    }
+      yield webhookEngine.dispatch('OBSERVED_SUCCESS', session);
+      yield handleSlotFreedAndPromote(session.receivingAccountId);
+    }, 'observed-success event');
   });
 
   eventEmitter.on('PAYMENT.MANUAL_REVIEW', (data) => {
-    const session = sessionRepo.findById(data.paymentId);
-    if (session) {
+    runBackground(function* () {
+      const session = yield sessionRepo.findById(data.paymentId);
+      if (!session) return;
       server.broadcastSse(session.id, 'status_change', {
         status: PaymentStatus.MANUAL_REVIEW,
         settlementState: 'MANUAL_REVIEW',
         reason: data.reason || null
       });
-      webhookEngine.dispatch('MANUAL_REVIEW', session).catch(() => {});
-      handleSlotFreedAndPromote(session.receivingAccountId);
-    }
+      yield webhookEngine.dispatch('MANUAL_REVIEW', session);
+      yield handleSlotFreedAndPromote(session.receivingAccountId);
+    }, 'manual-review event');
   });
 
   eventEmitter.on('PAYMENT.RECONCILED', (data) => {
-    const session = sessionRepo.findById(data.paymentId);
-    if (session && session.status === PaymentStatus.RECONCILED) {
+    runBackground(function* () {
+      const session = yield sessionRepo.findById(data.paymentId);
+      if (!session || session.status !== PaymentStatus.RECONCILED) return;
       server.broadcastSse(session.id, 'status_change', {
         status: PaymentStatus.RECONCILED,
         settlementState: 'RECONCILED',
         statementLineId: data.statementLineId || null
       });
-      webhookEngine.dispatch('RECONCILED', session).catch(() => {});
-    }
+      yield webhookEngine.dispatch('RECONCILED', session);
+    }, 'reconciled event');
   });
 
   // When a payment succeeds, fails, expires, or cancels: dispatch webhook & promote next queued customer
   eventEmitter.on('PAYMENT.SUCCESS', (data) => {
-    const session = sessionRepo.findById(data.paymentId);
-    if (session) {
+    runBackground(function* () {
+      const session = yield sessionRepo.findById(data.paymentId);
+      if (!session) return;
       server.broadcastSse(session.id, 'status_change', {
         status: PaymentStatus.SUCCESS,
         verificationLevel: data.verificationLevel || session.verificationLevel || 1,
         verificationTag: data.verificationTag || session.verificationTag,
         sources: data.sources || session.verificationSources
       });
-      webhookEngine.dispatch('SUCCESS', session).catch(() => {});
-      handleSlotFreedAndPromote(session.receivingAccountId);
-    }
+      yield webhookEngine.dispatch('SUCCESS', session);
+      yield handleSlotFreedAndPromote(session.receivingAccountId);
+    }, 'success event');
   });
 
   eventEmitter.on('PAYMENT.LEVEL1_VERIFIED', (data) => {
@@ -239,33 +256,36 @@ export function createPaymentApp(customDb = null, options = {}) {
   });
 
   eventEmitter.on('PAYMENT.FAILED', (data) => {
-    const session = sessionRepo.findById(data.paymentId);
-    if (session) {
-      webhookEngine.dispatch('FAILED', session).catch(() => {});
-      handleSlotFreedAndPromote(session.receivingAccountId);
-    }
+    runBackground(function* () {
+      const session = yield sessionRepo.findById(data.paymentId);
+      if (!session) return;
+      yield webhookEngine.dispatch('FAILED', session);
+      yield handleSlotFreedAndPromote(session.receivingAccountId);
+    }, 'failed event');
   });
 
   eventEmitter.on('PAYMENT.EXPIRED', (data) => {
-    const session = sessionRepo.findById(data.paymentId);
-    if (session) {
+    runBackground(function* () {
+      const session = yield sessionRepo.findById(data.paymentId);
+      if (!session) return;
       server.broadcastSse(session.id, 'status_change', {
         status: PaymentStatus.EXPIRED
       });
-      webhookEngine.dispatch('EXPIRED', session).catch(() => {});
-      handleSlotFreedAndPromote(session.receivingAccountId);
-    }
+      yield webhookEngine.dispatch('EXPIRED', session);
+      yield handleSlotFreedAndPromote(session.receivingAccountId);
+    }, 'expired event');
   });
 
   eventEmitter.on('PAYMENT.CANCELLED', (data) => {
-    const session = sessionRepo.findById(data.paymentId);
-    if (session) {
+    runBackground(function* () {
+      const session = yield sessionRepo.findById(data.paymentId);
+      if (!session) return;
       server.broadcastSse(session.id, 'status_change', {
         status: PaymentStatus.CANCELLED
       });
-      webhookEngine.dispatch('CANCELLED', session).catch(() => {});
-      handleSlotFreedAndPromote(session.receivingAccountId);
-    }
+      yield webhookEngine.dispatch('CANCELLED', session);
+      yield handleSlotFreedAndPromote(session.receivingAccountId);
+    }, 'cancelled event');
   });
 
   eventEmitter.on('PAYMENT.FRAUD_BLOCKED', (data) => {
@@ -296,53 +316,55 @@ export function createPaymentApp(customDb = null, options = {}) {
 
   // Continuous 1-second background queue sync and auto-expiry daemon
   const queueSyncDaemon = setInterval(() => {
+    runBackground(function* () {
     try {
       const nowIso = new Date().toISOString();
 
       // Sweep expired ACTIVE sessions
-      const expiredActive = db.query(`
+      const expiredActive = yield db.query(`
         SELECT id, merchant_id, order_id, receiving_account_id FROM payment_sessions
         WHERE status = 'ACTIVE' AND expires_at <= ?
       `, [nowIso]);
 
       for (const row of expiredActive) {
-        sessionRepo.transitionToTerminal(row.id, PaymentStatus.EXPIRED);
+        yield sessionRepo.transitionToTerminal(row.id, PaymentStatus.EXPIRED);
         server.broadcastSse(row.id, 'status_change', { status: PaymentStatus.EXPIRED });
         eventEmitter.emit('PAYMENT.EXPIRED', {
           paymentId: row.id,
           orderId: row.order_id,
           merchantId: row.merchant_id
         });
-        handleSlotFreedAndPromote(row.receiving_account_id);
+        yield handleSlotFreedAndPromote(row.receiving_account_id);
       }
 
       // Sweep failed PROCESSING sessions
-      const failedProc = db.query(`
+      const failedProc = yield db.query(`
         SELECT id, merchant_id, order_id, receiving_account_id FROM payment_sessions
         WHERE status = 'PROCESSING' AND processing_expires_at <= ?
       `, [nowIso]);
 
       for (const row of failedProc) {
-        sessionRepo.transitionToTerminal(row.id, PaymentStatus.FAILED);
+        yield sessionRepo.transitionToTerminal(row.id, PaymentStatus.FAILED);
         server.broadcastSse(row.id, 'status_change', { status: PaymentStatus.FAILED });
         eventEmitter.emit('PAYMENT.FAILED', {
           paymentId: row.id,
           orderId: row.order_id,
           merchantId: row.merchant_id
         });
-        handleSlotFreedAndPromote(row.receiving_account_id);
+        yield handleSlotFreedAndPromote(row.receiving_account_id);
       }
 
       // Scan for vacant receiving accounts that have waiting queued sessions
-      const vacantAccounts = db.query(`
+      const vacantAccounts = yield db.query(`
         SELECT id FROM payment_receiving_accounts
         WHERE is_active = 1 AND (is_slot_busy = 0 OR current_active_session_id IS NULL)
       `);
 
       for (const acc of vacantAccounts) {
-        handleSlotFreedAndPromote(acc.id);
+        yield handleSlotFreedAndPromote(acc.id);
       }
     } catch {}
+    }, 'queue synchronization');
   }, 1000);
 
   if (queueSyncDaemon.unref) queueSyncDaemon.unref();
@@ -379,7 +401,7 @@ export function createPaymentApp(customDb = null, options = {}) {
   });
 
   // Execute crash recovery on boot (AFTER event listeners are wired so recovered terminal transitions emit webhooks)
-  const recoveryStats = recoveryEngine.recover();
+  const recoveryStats = await recoveryEngine.recover();
   // Replay only outboxed transitions that lack a durable delivery record.
   webhookEngine.recoverOutbox().catch(err => {
     console.error('[webhook] Failed to recover terminal-event outbox:', err.message);
@@ -469,11 +491,11 @@ export function createPaymentApp(customDb = null, options = {}) {
   };
 }
 
-export function startServer(port = null, customDb = null) {
+export async function startServer(port = null, customDb = null) {
   const finalPort = port ?? Number(
   process.env.PORT || process.env.PAYMENT_API_PORT || 6100
   );
-  const app = createPaymentApp(customDb);
+  const app = await createPaymentApp(customDb);
 
   return new Promise(resolve => {
     // Loopback by default; reach this service via the local Cloudflare Tunnel, not 0.0.0.0.
@@ -494,5 +516,8 @@ export function startServer(port = null, customDb = null) {
 
 // Auto-run if executed directly as main script
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  startServer();
+  startServer().catch(err => {
+    console.error('[Payment API] Startup failed:', err);
+    process.exitCode = 1;
+  });
 }

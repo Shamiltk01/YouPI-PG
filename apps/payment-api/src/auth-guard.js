@@ -1,4 +1,5 @@
 import { getAdminToken, getObserverToken, safeEqual, hasBearer } from '@youpi/common';
+import { runMaybe } from '@youpi/db';
 import { HttpServer } from './server.js';
 
 /** Admin-prefixed routes that are intentionally public (static APK download for pairing). */
@@ -93,11 +94,13 @@ export function isPaymentOwner(req, session, ctx) {
   const presented = req.headers['x-merchant-key'];
   if (!presented || typeof presented !== 'string' || !presented.trim()) return false;
 
-  const merchant = ctx.merchantRepo?.findById ? ctx.merchantRepo.findById(session.merchantId) : null;
-  if (!merchant) return false;
-  if (typeof ctx.merchantRepo?.verifyApiKey === 'function') {
-    return ctx.merchantRepo.verifyApiKey(merchant, presented.trim());
-  }
-  if (!merchant.webhookSecret) return false;
-  return safeEqual(presented.trim(), merchant.webhookSecret);
+  return runMaybe(function* () {
+    const merchant = ctx.merchantRepo?.findById ? yield ctx.merchantRepo.findById(session.merchantId) : null;
+    if (!merchant) return false;
+    if (typeof ctx.merchantRepo?.verifyApiKey === 'function') {
+      return ctx.merchantRepo.verifyApiKey(merchant, presented.trim());
+    }
+    if (!merchant.webhookSecret) return false;
+    return safeEqual(presented.trim(), merchant.webhookSecret);
+  });
 }

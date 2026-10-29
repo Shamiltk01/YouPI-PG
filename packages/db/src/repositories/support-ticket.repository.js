@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { TicketStatus, SenderType } from '@youpi/common';
+import { mapMaybe, runMaybe } from '../maybe.js';
 
 export class SupportTicketRepository {
   /**
@@ -18,7 +19,9 @@ export class SupportTicketRepository {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    this.db.execute(sql, [
+    const repository = this;
+    return runMaybe(function* () {
+      yield repository.db.execute(sql, [
       id,
       data.merchantId,
       data.customerId,
@@ -27,49 +30,45 @@ export class SupportTicketRepository {
       data.status || TicketStatus.OPEN,
       now,
       now
-    ]);
+      ]);
 
-    if (data.initialMessage) {
-      this.addMessage({
-        ticketId: id,
-        senderType: data.initialMessage.senderType || SenderType.CUSTOMER,
-        senderId: data.initialMessage.senderId || data.customerId,
-        message: data.initialMessage.message
-      });
-    }
+      if (data.initialMessage) {
+        yield repository.addMessage({
+          ticketId: id,
+          senderType: data.initialMessage.senderType || SenderType.CUSTOMER,
+          senderId: data.initialMessage.senderId || data.customerId,
+          message: data.initialMessage.message
+        });
+      }
 
-    return this.findTicketById(id);
+      return yield repository.findTicketById(id);
+    });
   }
 
   findTicketById(id) {
-    const row = this.db.queryOne('SELECT * FROM support_tickets WHERE id = ?', [id]);
-    if (!row) return null;
-    return this.mapTicketRow(row);
+    return mapMaybe(this.db.queryOne('SELECT * FROM support_tickets WHERE id = ?', [id]), row => row ? this.mapTicketRow(row) : null);
   }
 
   findTicketsByCustomer(customerId) {
-    const rows = this.db.query(
+    return mapMaybe(this.db.query(
       'SELECT * FROM support_tickets WHERE customer_id = ? ORDER BY updated_at DESC',
       [customerId]
-    );
-    return rows.map(r => this.mapTicketRow(r));
+    ), rows => rows.map(r => this.mapTicketRow(r)));
   }
 
   findTicketsByMerchant(merchantId) {
-    const rows = this.db.query(
+    return mapMaybe(this.db.query(
       'SELECT * FROM support_tickets WHERE merchant_id = ? ORDER BY updated_at DESC',
       [merchantId]
-    );
-    return rows.map(r => this.mapTicketRow(r));
+    ), rows => rows.map(r => this.mapTicketRow(r)));
   }
 
   updateTicketStatus(ticketId, status) {
     const now = new Date().toISOString();
-    this.db.execute(
+    return mapMaybe(this.db.execute(
       'UPDATE support_tickets SET status = ?, updated_at = ? WHERE id = ?',
       [status, now, ticketId]
-    );
-    return this.findTicketById(ticketId);
+    ), () => this.findTicketById(ticketId));
   }
 
   addMessage(data) {
@@ -77,7 +76,9 @@ export class SupportTicketRepository {
     const now = new Date().toISOString();
     const attachments = typeof data.attachments === 'object' ? JSON.stringify(data.attachments) : (data.attachments || '[]');
 
-    this.db.execute(`
+    const repository = this;
+    return runMaybe(function* () {
+    yield repository.db.execute(`
       INSERT INTO ticket_messages (id, ticket_id, sender_type, sender_id, message, attachments, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `, [
@@ -91,26 +92,24 @@ export class SupportTicketRepository {
     ]);
 
     // Update ticket updated_at
-    this.db.execute(
+    yield repository.db.execute(
       'UPDATE support_tickets SET updated_at = ? WHERE id = ?',
       [now, data.ticketId]
     );
 
-    return this.findMessageById(id);
+    return yield repository.findMessageById(id);
+    });
   }
 
   findMessageById(id) {
-    const row = this.db.queryOne('SELECT * FROM ticket_messages WHERE id = ?', [id]);
-    if (!row) return null;
-    return this.mapMessageRow(row);
+    return mapMaybe(this.db.queryOne('SELECT * FROM ticket_messages WHERE id = ?', [id]), row => row ? this.mapMessageRow(row) : null);
   }
 
   findMessagesByTicket(ticketId) {
-    const rows = this.db.query(
+    return mapMaybe(this.db.query(
       'SELECT * FROM ticket_messages WHERE ticket_id = ? ORDER BY created_at ASC',
       [ticketId]
-    );
-    return rows.map(r => this.mapMessageRow(r));
+    ), rows => rows.map(r => this.mapMessageRow(r)));
   }
 
   mapTicketRow(row) {

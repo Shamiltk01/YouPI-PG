@@ -23,7 +23,7 @@ export function registerStatementRoutes(server, ctx) {
       HttpServer.json(res, 400, { error: 'receivingAccountId and csv are required.' });
       return;
     }
-    const account = ctx.accountRepo.findById(receivingAccountId);
+    const account = await ctx.accountRepo.findById(receivingAccountId);
     if (!account) {
       HttpServer.json(res, 404, { error: 'Receiving account not found.' });
       return;
@@ -35,7 +35,7 @@ export function registerStatementRoutes(server, ctx) {
       auditRepo: ctx.auditRepo,
       eventEmitter: ctx.eventEmitter
     });
-    const result = engine.importCsv({ receivingAccountId, csvText: csv });
+    const result = await engine.importCsv({ receivingAccountId, csvText: csv });
     if (result.error) {
       HttpServer.json(res, 400, result);
       return;

@@ -11,7 +11,7 @@ import { createOfflineWhatsApp } from './fixtures/offline-whatsapp.js';
 test('WhatsApp Berry Protocol OTP Customer Auth & Merchant Configuration Suite', async (t) => {
   const customDb = new Database({ inMemory: true });
   const whatsapp = createOfflineWhatsApp();
-  const app = createPaymentApp(customDb, { otpCooldownMs: 0, whatsappBerryService: whatsapp });
+  const app = await createPaymentApp(customDb, { otpCooldownMs: 0, whatsappBerryService: whatsapp });
   const testPort = 6288;
 
   const serverInstance = await new Promise(resolve => {

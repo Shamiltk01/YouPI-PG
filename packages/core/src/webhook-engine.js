@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { PaymentSessionRepository } from '@youpi/db';
+import { PaymentSessionRepository, runMaybe } from '@youpi/db';
 import { generateHmac, toRupeesString, validateOutboundWebhookUrl } from '@youpi/common';
 import { toPublicOutcome, isDispatchableOutcome, settlementStateFor } from './state-machine.js';
 
@@ -25,7 +25,7 @@ export class WebhookEngine {
    * @param {string} deliveryId
    * @param {number} timestampNum
    */
-  _buildPayload(publicOutcome, session, deliveryId, timestampNum) {
+  async _buildPayload(publicOutcome, session, deliveryId, timestampNum) {
     // Resolve UTR / bank reference number if attributed.
     // The bank reference (UTR/RRN) lives on the attributed observation, not on the
     // session row. Merchants need it to reconcile a webhook against their bank
@@ -34,7 +34,7 @@ export class WebhookEngine {
     const attributedObsId = session.attributedObservationId || session.attributed_observation_id;
     if (!utr && attributedObsId) {
       try {
-        const obsRow = this.db.queryOne(
+        const obsRow = await this.db.queryOne(
           'SELECT bank_reference_number FROM payment_observations WHERE id = ?',
           [attributedObsId]
         );
@@ -83,7 +83,7 @@ export class WebhookEngine {
    */
   async dispatch(event, session) {
     const merchantId = session.merchantId || session.merchant_id;
-    const merchant = this.merchantRepo.findById(merchantId);
+    const merchant = await this.merchantRepo.findById(merchantId);
     if (!merchant || !merchant.webhookUrl) {
       return { delivered: false, deliveryId: '', error: 'No webhook URL configured for merchant.' };
     }
@@ -93,7 +93,7 @@ export class WebhookEngine {
 
     // One durable delivery per payment/event, including duplicate or replayed in-process
     // events. SQLite serializes the final create-or-read in the transaction below.
-    const prior = this.db.queryOne(
+    const prior = await this.db.queryOne(
       'SELECT id, is_successful, response_status, response_body FROM webhook_deliveries WHERE payment_id = ? AND event_type = ? ORDER BY created_at DESC LIMIT 1',
       [session.id, publicOutcome]
     );
@@ -104,7 +104,7 @@ export class WebhookEngine {
     // Terminal transitions already have a durable outbox entry. If configuration
     // is missing or unsafe, KEEP that entry instead of recording an irrecoverable
     // synthetic failure row; the operator can repair configuration and replay.
-    const isOutboxed = Boolean(this.db.queryOne(
+    const isOutboxed = Boolean(await this.db.queryOne(
       'SELECT payment_id FROM payment_webhook_outbox WHERE payment_id = ?',
       [session.id]
     ));
@@ -115,7 +115,7 @@ export class WebhookEngine {
         return { delivered: false, deliveryId: '', status: 500, error: 'Merchant webhookSecret is not configured.' };
       }
       const deliveryId = crypto.randomUUID();
-      this.db.execute(`
+      await this.db.execute(`
         INSERT INTO webhook_deliveries (
           id, merchant_id, payment_id, event_type, payload, endpoint_url,
           response_status, response_body, attempt_count, is_successful, next_retry_at, created_at
@@ -139,7 +139,7 @@ export class WebhookEngine {
         return { delivered: false, deliveryId: '', status: 400, error: `Webhook delivery blocked: ${endpointCheck.error}` };
       }
       const deliveryId = crypto.randomUUID();
-      this.db.execute(`
+      await this.db.execute(`
         INSERT INTO webhook_deliveries (
           id, merchant_id, payment_id, event_type, payload, endpoint_url,
           response_status, response_body, attempt_count, is_successful, next_retry_at, created_at
@@ -159,7 +159,7 @@ export class WebhookEngine {
 
     // 3. Persist pending delivery row BEFORE outbound HTTP request (crash-safe write-ahead record).
     // Check if an unsent row already exists for this payment + event (e.g., created by recovery backfill).
-    const existingPending = this.db.queryOne(`
+    const existingPending = await this.db.queryOne(`
       SELECT id, payload FROM webhook_deliveries
       WHERE payment_id = ? AND event_type = ? AND is_successful = 0
       ORDER BY created_at DESC LIMIT 1
@@ -180,7 +180,7 @@ export class WebhookEngine {
         if (parsed && parsed.deliveryId) deliveryId = String(parsed.deliveryId);
       } catch {}
       timestamp = parsedTs || Date.now().toString();
-      this.db.execute(`
+      await this.db.execute(`
         UPDATE webhook_deliveries
         SET next_retry_at = ?, endpoint_url = ?
         WHERE id = ?
@@ -189,14 +189,14 @@ export class WebhookEngine {
       deliveryId = crypto.randomUUID();
       const timestampNum = Date.now();
       timestamp = timestampNum.toString();
-      const payloadObj = this._buildPayload(publicOutcome, session, deliveryId, timestampNum);
+      const payloadObj = await this._buildPayload(publicOutcome, session, deliveryId, timestampNum);
       payloadString = JSON.stringify(payloadObj);
 
-      this.db.execute(`
+      await this.db.execute(`
         INSERT INTO webhook_deliveries (
           id, merchant_id, payment_id, event_type, payload, endpoint_url,
           response_status, response_body, attempt_count, is_successful, next_retry_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?)
       `, [
         deliveryId,
         merchant.id,
@@ -204,13 +204,14 @@ export class WebhookEngine {
         publicOutcome,
         payloadString,
         merchant.webhookUrl,
+        isOutboxed ? 1 : 0,
         inFlightLeaseIso,
         nowIso
       ]);
     }
 
     // Outbox cleanup commits together with durable delivery preparation.
-    this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ?', [session.id]);
+    await this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ?', [session.id]);
 
     const signature = generateHmac(payloadString, merchant.webhookSecret);
     const timestampedSignature = generateHmac(`${timestamp}.${payloadString}`, merchant.webhookSecret);
@@ -231,7 +232,7 @@ export class WebhookEngine {
     // that row and skip the fetch — every first dispatch returned
     // { delivered: false, status: null, error: null } because of that re-query.
     if (isOutboxed) {
-      this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ?', [session.id]);
+      await this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ?', [session.id]);
     }
 
     let responseStatus = null;
@@ -259,11 +260,11 @@ export class WebhookEngine {
       ? null
       : new Date(Date.now() + 5000).toISOString();
 
-    this.db.execute(`
+    await this.db.execute(`
       UPDATE webhook_deliveries
       SET response_status = ?,
           response_body = ?,
-          attempt_count = MAX(1, attempt_count + 1),
+          attempt_count = MAX(1, attempt_count),
           is_successful = ?,
           next_retry_at = ?
       WHERE id = ?
@@ -289,7 +290,7 @@ export class WebhookEngine {
    * historic SUCCESS rows are never swept into webhooks on upgrade.
    */
   async recoverOutbox() {
-    const rows = this.db.query(`
+    const rows = await this.db.query(`
       SELECT o.payment_id, o.event_type
       FROM payment_webhook_outbox o
       WHERE NOT EXISTS (
@@ -300,9 +301,9 @@ export class WebhookEngine {
     `);
     const outcomes = [];
     for (const row of rows) {
-      const session = this.sessionRepo.findById(row.payment_id);
+      const session = await this.sessionRepo.findById(row.payment_id);
       if (!session) continue;
-      const merchant = this.merchantRepo.findById(session.merchantId);
+      const merchant = await this.merchantRepo.findById(session.merchantId);
       // Keep unconfigured merchants' events in the outbox for human remediation.
       if (!merchant?.webhookUrl || !merchant.webhookSecret) continue;
       outcomes.push(await this.dispatch(row.event_type, session));
@@ -317,7 +318,7 @@ export class WebhookEngine {
    * @param {{ resetInFlight?: boolean }} [options]
    * @returns {number} Number of recovered/backfilled webhook delivery rows
    */
-  recoverMissingDeliveries(options = {}) {
+  async recoverMissingDeliveries(options = {}) {
     const { resetInFlight = false } = options;
     const nowIso = new Date().toISOString();
     let recoveredCount = 0;
@@ -325,7 +326,7 @@ export class WebhookEngine {
     if (resetInFlight) {
       // Any row with attempt_count = 0 and response_status IS NULL was in-flight when the previous process died.
       // Reset its next_retry_at to now so retryPending() claims it immediately on boot.
-      const res = this.db.execute(`
+      const res = await this.db.execute(`
         UPDATE webhook_deliveries
         SET next_retry_at = ?
         WHERE is_successful = 0 AND attempt_count = 0 AND response_status IS NULL
@@ -334,7 +335,7 @@ export class WebhookEngine {
     }
 
     // Find terminal payment sessions for merchants with configured webhooks that have NO webhook_deliveries row at all.
-    const orphanedSessions = this.db.query(`
+    const orphanedSessions = await this.db.query(`
       SELECT ps.*
       FROM payment_sessions ps
       JOIN merchants m ON m.id = ps.merchant_id
@@ -348,7 +349,7 @@ export class WebhookEngine {
     `);
 
     for (const sessionRow of orphanedSessions) {
-      const merchant = this.merchantRepo.findById(sessionRow.merchant_id);
+      const merchant = await this.merchantRepo.findById(sessionRow.merchant_id);
       if (!merchant || !merchant.webhookUrl || !merchant.webhookSecret) continue;
 
       const endpointCheck = validateOutboundWebhookUrl(merchant.webhookUrl);
@@ -359,10 +360,10 @@ export class WebhookEngine {
         : sessionRow.status;
       const deliveryId = crypto.randomUUID();
       const timestampNum = Date.now();
-      const payloadObj = this._buildPayload(publicOutcome, sessionRow, deliveryId, timestampNum);
+      const payloadObj = await this._buildPayload(publicOutcome, sessionRow, deliveryId, timestampNum);
       const payloadString = JSON.stringify(payloadObj);
 
-      this.db.execute(`
+      await this.db.execute(`
         INSERT INTO webhook_deliveries (
           id, merchant_id, payment_id, event_type, payload, endpoint_url,
           response_status, response_body, attempt_count, is_successful, next_retry_at, created_at
@@ -390,7 +391,7 @@ export class WebhookEngine {
   async retryPending() {
     // Ensure any terminal session whose dispatch() was skipped before creating a row is backfilled first.
     try {
-      this.recoverMissingDeliveries({ resetInFlight: false });
+      await this.recoverMissingDeliveries({ resetInFlight: false });
     } catch {}
 
     const nowIso = new Date().toISOString();
@@ -398,7 +399,7 @@ export class WebhookEngine {
     // Snapshot a bounded batch, but claim each delivery only immediately before sending.
     // Twenty sequential 10s requests can outlive a shared 60s lease, allowing another
     // sweep to reclaim waiting items and consume attempts without a network request.
-    const candidates = this.db.query(`
+    const candidates = await this.db.query(`
       SELECT id FROM webhook_deliveries
       WHERE is_successful = 0 AND attempt_count < ? AND next_retry_at <= ?
       ORDER BY next_retry_at, id
@@ -409,26 +410,27 @@ export class WebhookEngine {
     const backoffs = [5000, 30000, 120000, 600000, 3600000];
 
     for (const candidate of candidates) {
-      const item = this.db.transaction(() => {
+      const engine = this;
+      const item = await this.db.transaction(() => runMaybe(function* () {
         // Another worker may have claimed or completed this item since the snapshot.
-        const pending = this.db.queryOne(`
+        const pending = yield engine.db.queryOne(`
           SELECT id, merchant_id, payment_id, event_type, payload, endpoint_url, attempt_count
           FROM webhook_deliveries
           WHERE id = ? AND is_successful = 0 AND attempt_count < ? AND next_retry_at <= ?
         `, [candidate.id, this.maxRetries, new Date().toISOString()]);
         if (!pending) return null;
 
-        this.db.execute(`
+        yield engine.db.execute(`
           UPDATE webhook_deliveries
           SET next_retry_at = ?, attempt_count = attempt_count + 1
           WHERE id = ?
         `, [new Date(Date.now() + 60000).toISOString(), pending.id]);
         return pending;
-      });
+      }.bind(engine)));
       if (!item) continue;
-      const merchant = this.merchantRepo.findById(item.merchant_id);
+      const merchant = await this.merchantRepo.findById(item.merchant_id);
       if (!merchant || !merchant.webhookSecret || !item.endpoint_url) {
-        this.db.execute(`
+        await this.db.execute(`
           UPDATE webhook_deliveries
           SET is_successful = 0, next_retry_at = NULL, response_body = 'Missing merchant or webhookSecret'
           WHERE id = ?
@@ -439,7 +441,7 @@ export class WebhookEngine {
       // Re-validate the stored endpoint before every retry (SSRF guard).
       const retryEndpoint = validateOutboundWebhookUrl(item.endpoint_url);
       if (!retryEndpoint.valid) {
-        this.db.execute(`
+        await this.db.execute(`
           UPDATE webhook_deliveries
           SET is_successful = 0, next_retry_at = NULL, response_body = ?
           WHERE id = ?
@@ -499,7 +501,7 @@ export class WebhookEngine {
         ? null
         : new Date(Date.now() + nextRetryDelay).toISOString();
 
-      this.db.execute(`
+      await this.db.execute(`
         UPDATE webhook_deliveries
         SET is_successful = ?, response_status = ?, response_body = ?, next_retry_at = ?
         WHERE id = ?

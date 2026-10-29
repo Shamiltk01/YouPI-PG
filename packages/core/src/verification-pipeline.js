@@ -9,6 +9,7 @@ import {
 } from '@youpi/common';
 import { extractIntelligentAmount } from './bank-sms-parser.js';
 import { ObservationNormalizer } from './normalizer.js';
+import { runMaybe } from '@youpi/db';
 
 /**
  * Universal Institutional Identifier: Every official Indian bank alert domain ends with .bank.in
@@ -118,6 +119,7 @@ export class PaymentVerificationPipeline {
    * }} input
    */
   process(input) {
+    return runMaybe(function* () {
     const isTest = Boolean(input.isTest);
     const testModeActive = Boolean(input.testModeActive);
     // Bank credit notifications are a few hundred bytes. Capping the text bounds the cost of
@@ -242,15 +244,15 @@ export class PaymentVerificationPipeline {
     const observedVpa = ((rawText.match(/[a-zA-Z0-9._-]{2,64}@[a-zA-Z0-9._-]{2,32}/) || [])[0] || '').toLowerCase() || null;
 
     if (input.paymentSessionId) {
-      session = this.sessionRepo.findById(input.paymentSessionId);
+      session = yield this.sessionRepo.findById(input.paymentSessionId);
     } else if (input.receivingAccountId) {
-      session = this.sessionRepo.findCurrentActiveOrProcessing(input.receivingAccountId);
+      session = yield this.sessionRepo.findCurrentActiveOrProcessing(input.receivingAccountId);
     }
 
     if (!session) {
       // 1. Try finding active or processing session for this specific receiving account
       if (input.receivingAccountId) {
-        const row = this.db.queryOne(
+        const row = yield this.db.queryOne(
           `SELECT * FROM payment_sessions WHERE receiving_account_id = ? AND status IN ('ACTIVE', 'PROCESSING') ORDER BY created_at DESC LIMIT 1`,
           [input.receivingAccountId]
         );
@@ -260,7 +262,7 @@ export class PaymentVerificationPipeline {
       //    lookup inside a single merchant; the previous gateway-wide "any active receiving
       //    account" query could settle an unrelated merchant's live session.
       if (!session && observedVpa) {
-        const row = this.db.queryOne(`
+        const row = yield this.db.queryOne(`
           SELECT ps.* FROM payment_sessions ps
           JOIN payment_receiving_accounts ra ON ps.receiving_account_id = ra.id
           WHERE LOWER(ra.upi_id) = ? AND ps.status IN ('ACTIVE', 'PROCESSING')
@@ -271,7 +273,7 @@ export class PaymentVerificationPipeline {
       // 3. Check for recently completed session on this receiving account for dual verification upgrade
       if (!session && input.receivingAccountId) {
         const sixtySecsAgo = new Date(Date.now() - 60000).toISOString();
-        const row = this.db.queryOne(
+        const row = yield this.db.queryOne(
           `SELECT * FROM payment_sessions WHERE receiving_account_id = ? AND status IN ('SUCCESS', 'OBSERVED_SUCCESS', 'RECONCILED') AND completed_at >= ? ORDER BY completed_at DESC LIMIT 1`,
           [input.receivingAccountId, sixtySecsAgo]
         );
@@ -281,11 +283,11 @@ export class PaymentVerificationPipeline {
 
     let customer = null;
     if (session?.customerId && this.customerRepo) {
-      customer = this.customerRepo.findById(session.customerId);
+      customer = yield this.customerRepo.findById(session.customerId);
     } else if (input.customerId && this.customerRepo) {
-      customer = this.customerRepo.findById(input.customerId);
+      customer = yield this.customerRepo.findById(input.customerId);
     } else if (sender && this.customerRepo) {
-      customer = this.customerRepo.findByIdentifier(sender);
+      customer = yield this.customerRepo.findByIdentifier(sender);
     }
 
     // Determine attribution to customer's registered identity (Phone, Email, or Submission Token)
@@ -618,7 +620,7 @@ export class PaymentVerificationPipeline {
       // and then only within that VPA's merchant.
       const scopeByVpa = observedVpa || (parsedData.vpa ? String(parsedData.vpa).toLowerCase() : null);
       if (scopeByVpa) {
-        const matchRow = this.db.queryOne(`
+        const matchRow = yield this.db.queryOne(`
           SELECT ps.* FROM payment_sessions ps
           JOIN payment_receiving_accounts ra ON ps.receiving_account_id = ra.id
           WHERE ps.status IN ('ACTIVE', 'PROCESSING')
@@ -759,7 +761,7 @@ export class PaymentVerificationPipeline {
       observedAt: receivedAt
     });
 
-    const existingObs = this.obsRepo.findByFingerprint(fingerprint);
+    const existingObs = yield this.obsRepo.findByFingerprint(fingerprint);
     if (existingObs && existingObs.source === observerSourceEnum) {
       stage4 = {
         stage: 4,
@@ -782,7 +784,7 @@ export class PaymentVerificationPipeline {
     }
 
     // 5. Transaction Reference Already Used Check
-    const priorUsedSession = this.db.queryOne(`
+    const priorUsedSession = yield this.db.queryOne(`
       SELECT ps.id, ps.order_id
       FROM payment_sessions ps
       JOIN payment_observations po ON ps.attributed_observation_id = po.id
@@ -940,7 +942,7 @@ export class PaymentVerificationPipeline {
 
       // Store security event in DB
       if (this.customerRepo && typeof this.customerRepo.createSecurityEvent === 'function') {
-        this.customerRepo.createSecurityEvent({
+        yield this.customerRepo.createSecurityEvent({
           merchantId: session.merchantId,
           customerId: customer.id,
           paymentSessionId: session.id,
@@ -982,7 +984,7 @@ export class PaymentVerificationPipeline {
         };
 
         if (this.auditRepo) {
-          this.auditRepo.log({
+          yield this.auditRepo.log({
             merchantId: session.merchantId,
             entityType: 'PAYMENT_SESSION',
             entityId: session.id,
@@ -994,7 +996,7 @@ export class PaymentVerificationPipeline {
       } else {
         // Automatic banning is ENABLED: Ban user instantly right away!
         autoBanApplied = true;
-        this.customerRepo.banCustomer(customer.id, 'FRAUDULENT_PAYMENT_INJECTION', { lastDevice: evidence.deviceInfo });
+        yield this.customerRepo.banCustomer(customer.id, 'FRAUDULENT_PAYMENT_INJECTION', { lastDevice: evidence.deviceInfo });
         securityDiagnostic = 'FRAUDULENT_PAYMENT_INJECTION detected. Associated customer identity has been automatically BANNED by Security Engine.';
 
         stage5 = {
@@ -1010,7 +1012,7 @@ export class PaymentVerificationPipeline {
         };
 
         if (this.auditRepo) {
-          this.auditRepo.log({
+          yield this.auditRepo.log({
             merchantId: session.merchantId,
             entityType: 'CUSTOMER',
             entityId: customer.id,
@@ -1093,7 +1095,7 @@ export class PaymentVerificationPipeline {
 
       if (session?.id && this.sessionRepo && [PaymentStatus.ACTIVE, PaymentStatus.PROCESSING, PaymentStatus.INITIATED, PaymentStatus.QUEUED].includes(session.status)) {
         try {
-          this.sessionRepo.transitionToTerminal(session.id, PaymentStatus.MANUAL_REVIEW, { reason: 'FRAUDULENT_PAYMENT_INJECTION' });
+          yield this.sessionRepo.transitionToTerminal(session.id, PaymentStatus.MANUAL_REVIEW, { reason: 'FRAUDULENT_PAYMENT_INJECTION' });
           session.status = PaymentStatus.MANUAL_REVIEW;
         } catch {}
       }
@@ -1131,7 +1133,7 @@ export class PaymentVerificationPipeline {
     });
 
     const attributionResult = this.attributionEngine
-      ? this.attributionEngine.processObservation(normalized)
+      ? yield this.attributionEngine.processObservation(normalized)
       : {
           attributed: true,
           outcomeStatus: 'VERIFIED',
@@ -1160,7 +1162,7 @@ export class PaymentVerificationPipeline {
     const finalStatus = attributionResult.attributed ? 'VERIFIED' : 'UNRESOLVED';
 
     // Refresh session state after attribution
-    const updatedSession = this.sessionRepo.findById(session.id);
+    const updatedSession = yield this.sessionRepo.findById(session.id);
 
     return buildResult({
       finalStatus,
@@ -1173,5 +1175,6 @@ export class PaymentVerificationPipeline {
       session: updatedSession || session,
       attribution: attributionResult
     });
+    }.bind(this));
   }
 }

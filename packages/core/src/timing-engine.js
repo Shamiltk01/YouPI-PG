@@ -1,4 +1,5 @@
 import { PaymentStatus } from '@youpi/common';
+import { runMaybe } from '@youpi/db';
 
 export class TimingEngine {
   /**
@@ -36,7 +37,9 @@ export class TimingEngine {
     const delayMs = Math.max(0, expiresAt.getTime() - Date.now());
 
     const timer = setTimeout(() => {
-      this.handleActiveTimerExpiration(sessionId);
+      Promise.resolve(this.handleActiveTimerExpiration(sessionId)).catch(err => {
+        console.error('[TimingEngine] Active timer expiration failed:', err.message);
+      });
     }, delayMs);
 
     // Unref so timer doesn't prevent process exit if running standalone
@@ -52,41 +55,35 @@ export class TimingEngine {
    */
   handleActiveTimerExpiration(sessionId) {
     this.activeTimers.delete(sessionId);
+    const engine = this;
+    return runMaybe(function* () {
+      const session = yield engine.sessionRepo.findById(sessionId);
+      if (!session || session.status !== PaymentStatus.ACTIVE) return;
 
-    const session = this.sessionRepo.findById(sessionId);
-    if (!session) return;
+      yield engine.sessionRepo.transitionToTerminal(sessionId, PaymentStatus.EXPIRED);
+      if (engine.auditRepo) {
+        yield engine.auditRepo.log({
+          merchantId: session.merchantId,
+          entityType: 'PAYMENT_SESSION',
+          entityId: sessionId,
+          action: 'PAYMENT_EXPIRED_TIMEOUT',
+          actorType: 'SYSTEM',
+          details: { reason: '5-minute payment window elapsed without customer clicking Payment Done' }
+        });
+      }
 
-    // Invariant: Only expire if still in ACTIVE status
-    if (session.status !== PaymentStatus.ACTIVE) {
-      return;
-    }
-
-    // Transition to EXPIRED and release slot
-    this.sessionRepo.transitionToTerminal(sessionId, PaymentStatus.EXPIRED);
-
-    if (this.auditRepo) {
-      this.auditRepo.log({
+      engine.eventEmitter.emit('SESSION.EXPIRED', { sessionId, receivingAccountId: session.receivingAccountId });
+      engine.eventEmitter.emit('PAYMENT.EXPIRED', {
+        paymentId: sessionId,
+        orderId: session.orderId,
         merchantId: session.merchantId,
-        entityType: 'PAYMENT_SESSION',
-        entityId: sessionId,
-        action: 'PAYMENT_EXPIRED_TIMEOUT',
-        actorType: 'SYSTEM',
-        details: { reason: '5-minute payment window elapsed without customer clicking Payment Done' }
+        amountPaise: session.amountPaise
       });
-    }
 
-    this.eventEmitter.emit('SESSION.EXPIRED', { sessionId, receivingAccountId: session.receivingAccountId });
-    this.eventEmitter.emit('PAYMENT.EXPIRED', {
-      paymentId: sessionId,
-      orderId: session.orderId,
-      merchantId: session.merchantId,
-      amountPaise: session.amountPaise
+      if (session.receivingAccountId) {
+        yield engine.queueEngine.promoteNext(session.receivingAccountId, engine.activeDurationMs);
+      }
     });
-
-    // Immediately promote next queued customer
-    if (session.receivingAccountId) {
-      this.queueEngine.promoteNext(session.receivingAccountId, this.activeDurationMs);
-    }
   }
 
   /**
@@ -112,42 +109,44 @@ export class TimingEngine {
   handlePaymentDone(sessionId) {
     // Commit the database transition before cancelling the active timer. A failed
     // transition leaves the session ACTIVE, so its original expiry must stay armed.
-    const session = this.sessionRepo.transitionToProcessing(sessionId, this.processingDurationMs);
+    const engine = this;
+    return runMaybe(function* () {
+      const session = yield engine.sessionRepo.transitionToProcessing(sessionId, engine.processingDurationMs);
 
-    const activeTimer = this.activeTimers.get(sessionId);
-    if (activeTimer) {
-      clearTimeout(activeTimer);
-      this.activeTimers.delete(sessionId);
-    }
+      const activeTimer = engine.activeTimers.get(sessionId);
+      if (activeTimer) {
+        clearTimeout(activeTimer);
+        engine.activeTimers.delete(sessionId);
+      }
 
-    if (this.auditRepo) {
-      this.auditRepo.log({
-        merchantId: session.merchantId,
-        entityType: 'PAYMENT_SESSION',
-        entityId: sessionId,
-        action: 'CUSTOMER_CLICKED_PAYMENT_DONE',
-        actorType: 'CUSTOMER',
-        details: { processingExpiresAt: session.processingExpiresAt?.toISOString() }
+      if (engine.auditRepo) {
+        yield engine.auditRepo.log({
+          merchantId: session.merchantId,
+          entityType: 'PAYMENT_SESSION',
+          entityId: sessionId,
+          action: 'CUSTOMER_CLICKED_PAYMENT_DONE',
+          actorType: 'CUSTOMER',
+          details: { processingExpiresAt: session.processingExpiresAt?.toISOString() }
+        });
+      }
+
+      engine.eventEmitter.emit('SESSION.PROCESSING', {
+        sessionId,
+        receivingAccountId: session.receivingAccountId,
+        processingExpiresAt: session.processingExpiresAt
       });
-    }
 
-    this.eventEmitter.emit('SESSION.PROCESSING', {
-      sessionId,
-      receivingAccountId: session.receivingAccountId,
-      processingExpiresAt: session.processingExpiresAt
+      const delayMs = Math.max(0, session.processingExpiresAt.getTime() - Date.now());
+      const procTimer = setTimeout(() => {
+        Promise.resolve(engine.handleProcessingTimerExpiration(sessionId)).catch(err => {
+          console.error('[TimingEngine] Processing timer expiration failed:', err.message);
+        });
+      }, delayMs);
+
+      if (procTimer.unref) procTimer.unref();
+      engine.processingTimers.set(sessionId, procTimer);
+      return session;
     });
-
-    // 3. Start Timer 2 (30-second processing window)
-    const delayMs = Math.max(0, session.processingExpiresAt.getTime() - Date.now());
-
-    const procTimer = setTimeout(() => {
-      this.handleProcessingTimerExpiration(sessionId);
-    }, delayMs);
-
-    if (procTimer.unref) procTimer.unref();
-    this.processingTimers.set(sessionId, procTimer);
-
-    return session;
   }
 
   /**
@@ -157,41 +156,35 @@ export class TimingEngine {
    */
   handleProcessingTimerExpiration(sessionId) {
     this.processingTimers.delete(sessionId);
+    const engine = this;
+    return runMaybe(function* () {
+      const session = yield engine.sessionRepo.findById(sessionId);
+      if (!session || session.status !== PaymentStatus.PROCESSING) return;
 
-    const session = this.sessionRepo.findById(sessionId);
-    if (!session) return;
+      yield engine.sessionRepo.transitionToTerminal(sessionId, PaymentStatus.FAILED);
+      if (engine.auditRepo) {
+        yield engine.auditRepo.log({
+          merchantId: session.merchantId,
+          entityType: 'PAYMENT_SESSION',
+          entityId: sessionId,
+          action: 'PAYMENT_FAILED_NO_OBSERVATION',
+          actorType: 'SYSTEM',
+          details: { reason: '30-second verification window elapsed with no matching observation' }
+        });
+      }
 
-    // Invariant: Only fail if still in PROCESSING status (no observer matched it yet)
-    if (session.status !== PaymentStatus.PROCESSING) {
-      return;
-    }
-
-    // Transition to FAILED and release slot
-    this.sessionRepo.transitionToTerminal(sessionId, PaymentStatus.FAILED);
-
-    if (this.auditRepo) {
-      this.auditRepo.log({
+      engine.eventEmitter.emit('SESSION.FAILED', { sessionId, receivingAccountId: session.receivingAccountId });
+      engine.eventEmitter.emit('PAYMENT.FAILED', {
+        paymentId: sessionId,
+        orderId: session.orderId,
         merchantId: session.merchantId,
-        entityType: 'PAYMENT_SESSION',
-        entityId: sessionId,
-        action: 'PAYMENT_FAILED_NO_OBSERVATION',
-        actorType: 'SYSTEM',
-        details: { reason: '30-second verification window elapsed with no matching observation' }
+        amountPaise: session.amountPaise
       });
-    }
 
-    this.eventEmitter.emit('SESSION.FAILED', { sessionId, receivingAccountId: session.receivingAccountId });
-    this.eventEmitter.emit('PAYMENT.FAILED', {
-      paymentId: sessionId,
-      orderId: session.orderId,
-      merchantId: session.merchantId,
-      amountPaise: session.amountPaise
+      if (session.receivingAccountId) {
+        yield engine.queueEngine.promoteNext(session.receivingAccountId, engine.activeDurationMs);
+      }
     });
-
-    // Immediately promote next queued customer
-    if (session.receivingAccountId) {
-      this.queueEngine.promoteNext(session.receivingAccountId, this.activeDurationMs);
-    }
   }
 
   /**
@@ -200,42 +193,41 @@ export class TimingEngine {
    * @param {string} sessionId
    */
   handleCancel(sessionId) {
-    const session = this.sessionRepo.findById(sessionId);
-    if (!session) return null;
+    const engine = this;
+    return runMaybe(function* () {
+      const session = yield engine.sessionRepo.findById(sessionId);
+      if (!session) return null;
 
-    if ([PaymentStatus.PROCESSING, PaymentStatus.SUCCESS, PaymentStatus.OBSERVED_SUCCESS, PaymentStatus.RECONCILED, PaymentStatus.MANUAL_REVIEW, PaymentStatus.FAILED, PaymentStatus.EXPIRED, PaymentStatus.CANCELLED].includes(session.status)) {
-      return session; // cannot cancel in-flight PROCESSING or already terminal sessions
-    }
+      if ([PaymentStatus.PROCESSING, PaymentStatus.SUCCESS, PaymentStatus.OBSERVED_SUCCESS, PaymentStatus.RECONCILED, PaymentStatus.MANUAL_REVIEW, PaymentStatus.FAILED, PaymentStatus.EXPIRED, PaymentStatus.CANCELLED].includes(session.status)) {
+        return session;
+      }
 
-    this.clearTimers(sessionId);
+      engine.clearTimers(sessionId);
+      const updated = yield engine.sessionRepo.transitionToTerminal(sessionId, PaymentStatus.CANCELLED);
+      if (engine.auditRepo) {
+        yield engine.auditRepo.log({
+          merchantId: session.merchantId,
+          entityType: 'PAYMENT_SESSION',
+          entityId: sessionId,
+          action: 'PAYMENT_CANCELLED_BY_USER',
+          actorType: 'CUSTOMER',
+          details: { previousStatus: session.status }
+        });
+      }
 
-    const updated = this.sessionRepo.transitionToTerminal(sessionId, PaymentStatus.CANCELLED);
-
-    if (this.auditRepo) {
-      this.auditRepo.log({
+      engine.eventEmitter.emit('SESSION.CANCELLED', { sessionId, receivingAccountId: session.receivingAccountId });
+      engine.eventEmitter.emit('PAYMENT.CANCELLED', {
+        paymentId: sessionId,
+        orderId: session.orderId,
         merchantId: session.merchantId,
-        entityType: 'PAYMENT_SESSION',
-        entityId: sessionId,
-        action: 'PAYMENT_CANCELLED_BY_USER',
-        actorType: 'CUSTOMER',
-        details: { previousStatus: session.status }
+        amountPaise: session.amountPaise
       });
-    }
+      if (session.receivingAccountId) {
+        yield engine.queueEngine.promoteNext(session.receivingAccountId, engine.activeDurationMs);
+      }
 
-    this.eventEmitter.emit('SESSION.CANCELLED', { sessionId, receivingAccountId: session.receivingAccountId });
-    this.eventEmitter.emit('PAYMENT.CANCELLED', {
-      paymentId: sessionId,
-      orderId: session.orderId,
-      merchantId: session.merchantId,
-      amountPaise: session.amountPaise
+      return updated;
     });
-
-    // Immediately promote next queued customer
-    if (session.receivingAccountId) {
-      this.queueEngine.promoteNext(session.receivingAccountId, this.activeDurationMs);
-    }
-
-    return updated;
   }
 
   /**

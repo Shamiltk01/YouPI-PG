@@ -116,5 +116,8 @@ binding variables and must not be manually configured with deployment URLs.
 
 Vercel Services is currently beta. The native deployment still remains the
 recommended production target for the SQLite-backed gateway and its long-lived
-observer processes; a Vercel deployment must use a persistent database and
-separate worker strategy before handling production payment traffic.
+observer processes. The payment API database layer can connect to Layerbase's
+hosted SQLite endpoint through its PostgreSQL-wire URL; set that URL as the
+server-side `DATABASE_URL` in the Vercel Node.js runtime. This does not move the
+long-lived observer/retry jobs onto Vercel: a separate worker strategy is still
+required before handling production payment traffic.

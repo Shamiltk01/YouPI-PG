@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { LayerbaseDatabase } from './layerbase-database.js';
 import { runMigrations } from './migrate.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -172,15 +173,15 @@ export class Database {
     // A rejected BEGIN or SAVEPOINT must not leave a phantom nested transaction.
     this._transactionDepth = nextDepth;
 
-    try {
-      const result = callback();
+    let asyncResult = false;
+    const commit = () => {
       if (isNested) {
         this.db.exec(`RELEASE SAVEPOINT ${savepointName};`);
       } else {
         this.db.exec('COMMIT;');
       }
-      return result;
-    } catch (err) {
+    };
+    const rollback = () => {
       try {
         if (isNested) {
           this.db.exec(`ROLLBACK TO SAVEPOINT ${savepointName};`);
@@ -190,9 +191,34 @@ export class Database {
       } catch {
         // Ignore rollback error if already rolled back
       }
+    };
+
+    try {
+      const result = callback();
+      if (result && typeof result.then === 'function') {
+        asyncResult = true;
+        return result.then(value => {
+          try {
+            commit();
+            return value;
+          } catch (err) {
+            rollback();
+            throw err;
+          }
+        }, err => {
+          rollback();
+          throw err;
+        }).finally(() => {
+          this._transactionDepth--;
+        });
+      }
+      commit();
+      return result;
+    } catch (err) {
+      rollback();
       throw err;
     } finally {
-      this._transactionDepth--;
+      if (!asyncResult) this._transactionDepth--;
     }
   }
 
@@ -206,22 +232,32 @@ export class Database {
    */
   withRetry(operation, maxRetries = 3, baseDelayMs = 50) {
     let attempt = 0;
-    while (true) {
+    const run = () => {
       try {
-        return operation();
-      } catch (err) {
-        attempt++;
-        if (attempt > maxRetries || !isRetryableSqliteError(err)) {
-          if (isRetryableSqliteError(err)) {
-            throw new DatabaseBusyError(`Database lock contention after ${attempt} retry attempt(s): ${err.message}`, err);
-          }
-          throw err;
+        const result = operation();
+        if (result && typeof result.then === 'function') {
+          return result.catch(err => retryOrThrow(err, true));
         }
-        const delay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), 500) + Math.floor(Math.random() * 20);
-        const end = Date.now() + delay;
-        while (Date.now() < end) {}
+        return result;
+      } catch (err) {
+        return retryOrThrow(err, false);
       }
+    };
+    const retryOrThrow = (err, asynchronous) => {
+      attempt++;
+      if (attempt > maxRetries || !isRetryableSqliteError(err)) {
+        if (isRetryableSqliteError(err)) {
+          throw new DatabaseBusyError(`Database lock contention after ${attempt} retry attempt(s): ${err.message}`, err);
+        }
+        throw err;
+      }
+      const delay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), 500) + Math.floor(Math.random() * 20);
+      if (asynchronous) return new Promise(resolve => setTimeout(resolve, delay)).then(run);
+      const end = Date.now() + delay;
+      while (Date.now() < end) {}
+      return run();
     }
+    return run();
   }
 
   /**
@@ -234,6 +270,21 @@ export class Database {
 
 let defaultDbInstance = null;
 
+export function createDatabase(options = {}, env = process.env) {
+  const config = options && typeof options === 'object' ? options : {};
+  const connectionString = config.connectionString || env.DATABASE_URL;
+  if (!config.inMemory && connectionString) {
+    return new LayerbaseDatabase({
+      connectionString,
+      pool: config.pool || null
+    });
+  }
+  if (!config.inMemory && env.VERCEL && !connectionString) {
+    throw new Error('DATABASE_URL must be configured on Vercel; local SQLite is not persistent in serverless functions.');
+  }
+  return new Database(options);
+}
+
 /**
  * Returns the singleton database instance.
  * @param {{ dbPath?: string, inMemory?: boolean }} [options={}]
@@ -241,8 +292,10 @@ let defaultDbInstance = null;
  */
 export function getDatabase(options = {}) {
   if (!defaultDbInstance) {
-    defaultDbInstance = new Database(options);
-    ensureDatabaseInitialized(defaultDbInstance);
+    defaultDbInstance = createDatabase(options);
+    if (!defaultDbInstance.isLayerbase) {
+      ensureDatabaseInitialized(defaultDbInstance);
+    }
   }
   return defaultDbInstance;
 }

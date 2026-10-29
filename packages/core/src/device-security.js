@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { runMaybe } from '@youpi/db';
 import {
   safeEqual,
   issueDeviceCredential,
@@ -292,82 +293,84 @@ export function verifyRegisteredDeviceCredentials({
   signaturePayload,
   deviceRepo
 }) {
-  if (!deviceId || typeof deviceId !== 'string') {
-    return {
-      valid: false,
-      error: 'DEVICE_ID_REQUIRED',
-      message: 'A registered deviceId is required.'
-    };
-  }
-  if (!deviceRepo) {
-    return {
-      valid: false,
-      error: 'DEVICE_REPO_UNAVAILABLE',
-      message: 'Device repository is required for device verification.'
-    };
-  }
-
-  const dev = deviceRepo.findById(deviceId);
-  if (!dev || dev.status !== 'ACTIVE' || (typeof dev.publicKey === 'string' && dev.publicKey.startsWith('adhoc_'))) {
-    return {
-      valid: false,
-      error: 'DEVICE_REVOKED',
-      message: 'The device is unregistered, revoked, or invalid.'
-    };
-  }
-
-  const hasToken = typeof deviceToken === 'string' && deviceToken.trim().length > 0;
-  const hasSig = typeof deviceSignature === 'string' && deviceSignature.trim().length > 0;
-  const hasPayload = signaturePayload !== undefined && signaturePayload !== null && String(signaturePayload).trim().length > 0;
-
-  if (!hasToken && !hasSig) {
-    return {
-      valid: false,
-      error: 'DEVICE_CREDENTIALS_REQUIRED',
-      message: 'Device authentication credential (token or cryptographic signature) is required.'
-    };
-  }
-
-  if ((hasSig && !hasPayload) || (!hasSig && hasPayload)) {
-    return {
-      valid: false,
-      error: 'DEVICE_SIGNATURE_INVALID',
-      message: 'Both device signature and signed payload are required for signature verification.'
-    };
-  }
-
-  if (hasToken) {
-    let tokenOk = false;
-    if (typeof deviceRepo.verifyToken === 'function') {
-      tokenOk = deviceRepo.verifyToken(deviceId, deviceToken.trim());
-    } else if (dev.deviceToken) {
-      tokenOk = safeEqual(dev.deviceToken, deviceToken.trim()) && verifyDeviceCredential(deviceId, deviceToken.trim());
-    } else {
-      tokenOk = verifyDeviceCredential(deviceId, deviceToken.trim());
-    }
-    if (!tokenOk) {
+  return runMaybe(function* () {
+    if (!deviceId || typeof deviceId !== 'string') {
       return {
         valid: false,
-        error: 'DEVICE_TOKEN_INVALID',
-        message: 'Device token failed verification.'
+        error: 'DEVICE_ID_REQUIRED',
+        message: 'A registered deviceId is required.'
       };
     }
-  }
+    if (!deviceRepo) {
+      return {
+        valid: false,
+        error: 'DEVICE_REPO_UNAVAILABLE',
+        message: 'Device repository is required for device verification.'
+      };
+    }
 
-  if (hasSig) {
-    const sigOk = verifyDeviceSignature(dev.publicKey, signaturePayload, deviceSignature, {
-      expectedDeviceId: deviceId
-    });
-    if (!sigOk) {
+    const dev = yield deviceRepo.findById(deviceId);
+    if (!dev || dev.status !== 'ACTIVE' || (typeof dev.publicKey === 'string' && dev.publicKey.startsWith('adhoc_'))) {
+      return {
+        valid: false,
+        error: 'DEVICE_REVOKED',
+        message: 'The device is unregistered, revoked, or invalid.'
+      };
+    }
+
+    const hasToken = typeof deviceToken === 'string' && deviceToken.trim().length > 0;
+    const hasSig = typeof deviceSignature === 'string' && deviceSignature.trim().length > 0;
+    const hasPayload = signaturePayload !== undefined && signaturePayload !== null && String(signaturePayload).trim().length > 0;
+
+    if (!hasToken && !hasSig) {
+      return {
+        valid: false,
+        error: 'DEVICE_CREDENTIALS_REQUIRED',
+        message: 'Device authentication credential (token or cryptographic signature) is required.'
+      };
+    }
+
+    if ((hasSig && !hasPayload) || (!hasSig && hasPayload)) {
       return {
         valid: false,
         error: 'DEVICE_SIGNATURE_INVALID',
-        message: 'Device cryptographic signature failed verification.'
+        message: 'Both device signature and signed payload are required for signature verification.'
       };
     }
-  }
 
-  return { valid: true, device: dev };
+    if (hasToken) {
+      let tokenOk = false;
+      if (typeof deviceRepo.verifyToken === 'function') {
+        tokenOk = yield deviceRepo.verifyToken(deviceId, deviceToken.trim());
+      } else if (dev.deviceToken) {
+        tokenOk = safeEqual(dev.deviceToken, deviceToken.trim()) && verifyDeviceCredential(deviceId, deviceToken.trim());
+      } else {
+        tokenOk = verifyDeviceCredential(deviceId, deviceToken.trim());
+      }
+      if (!tokenOk) {
+        return {
+          valid: false,
+          error: 'DEVICE_TOKEN_INVALID',
+          message: 'Device token failed verification.'
+        };
+      }
+    }
+
+    if (hasSig) {
+      const sigOk = verifyDeviceSignature(dev.publicKey, signaturePayload, deviceSignature, {
+        expectedDeviceId: deviceId
+      });
+      if (!sigOk) {
+        return {
+          valid: false,
+          error: 'DEVICE_SIGNATURE_INVALID',
+          message: 'Device cryptographic signature failed verification.'
+        };
+      }
+    }
+
+    return { valid: true, device: dev };
+  });
 }
 
 /**
@@ -393,114 +396,99 @@ export function verifyRegisteredDeviceCredentials({
  */
 export function validateSessionDeviceAccess(options) {
   const { session, requestingDeviceId, deviceToken, deviceSignature, signaturePayload, deviceRepo } = options || {};
-
-  if (!session) {
-    return {
-      allowed: false,
-      error: 'SESSION_NOT_FOUND',
-      message: 'Payment session not found'
-    };
-  }
-
-  const boundDeviceId = session.deviceId;
-
-  // If session is not yet bound to any device:
-  // Only allow binding if the caller presents a registered, cryptographically verified device.
-  if (!boundDeviceId) {
-    if (!requestingDeviceId) {
+  return runMaybe(function* () {
+    if (!session) {
       return {
         allowed: false,
-        error: 'DEVICE_ID_REQUIRED',
-        session_id: session.id,
-        action: 'REGISTER_DEVICE',
-        message: 'A registered device identity is required to access or bind this checkout session.',
-        boundDeviceId: null,
-        requestingDeviceId: null
+        error: 'SESSION_NOT_FOUND',
+        message: 'Payment session not found'
       };
     }
 
-    const credCheck = verifyRegisteredDeviceCredentials({
-      deviceId: requestingDeviceId,
+    const boundDeviceId = session.deviceId;
+    if (!boundDeviceId) {
+      if (!requestingDeviceId) {
+        return {
+          allowed: false,
+          error: 'DEVICE_ID_REQUIRED',
+          session_id: session.id,
+          action: 'REGISTER_DEVICE',
+          message: 'A registered device identity is required to access or bind this checkout session.',
+          boundDeviceId: null,
+          requestingDeviceId: null
+        };
+      }
+
+      const credCheck = yield verifyRegisteredDeviceCredentials({
+        deviceId: requestingDeviceId,
+        deviceToken,
+        deviceSignature,
+        signaturePayload,
+        deviceRepo
+      });
+      if (!credCheck.valid) {
+        return {
+          allowed: false,
+          error: credCheck.error === 'DEVICE_SIGNATURE_INVALID' ? 'DEVICE_SIGNATURE_INVALID' : 'DUPLICATE_SESSION_DETECTED',
+          session_id: session.id,
+          action: 'END_SESSION_AND_CREATE_NEW',
+          message: credCheck.message || 'Valid registered device credentials are required.',
+          boundDeviceId: null,
+          requestingDeviceId
+        };
+      }
+      return { allowed: true, shouldBind: true, requestingDeviceId };
+    }
+
+    if (!requestingDeviceId || requestingDeviceId !== boundDeviceId) {
+      return {
+        allowed: false,
+        error: 'DUPLICATE_SESSION_DETECTED',
+        session_id: session.id,
+        action: 'END_SESSION_AND_CREATE_NEW',
+        message: 'This payment session was created on another device. For security reasons, this session cannot be continued from this device.',
+        boundDeviceId,
+        requestingDeviceId: requestingDeviceId || null
+      };
+    }
+
+    const credCheck = yield verifyRegisteredDeviceCredentials({
+      deviceId: boundDeviceId,
       deviceToken,
       deviceSignature,
       signaturePayload,
       deviceRepo
     });
-
     if (!credCheck.valid) {
+      if (credCheck.error === 'DEVICE_REVOKED') {
+        return {
+          allowed: false,
+          error: 'DEVICE_REVOKED',
+          session_id: session.id,
+          action: 'END_SESSION_AND_CREATE_NEW',
+          message: 'The device registered for this payment session has been revoked or is invalid.'
+        };
+      }
+      if (credCheck.error === 'DEVICE_SIGNATURE_INVALID') {
+        return {
+          allowed: false,
+          error: 'DEVICE_SIGNATURE_INVALID',
+          session_id: session.id,
+          action: 'END_SESSION_AND_CREATE_NEW',
+          message: 'Device cryptographic signature failed verification.'
+        };
+      }
       return {
         allowed: false,
-        error: credCheck.error === 'DEVICE_SIGNATURE_INVALID' ? 'DEVICE_SIGNATURE_INVALID' : 'DUPLICATE_SESSION_DETECTED',
+        error: 'DUPLICATE_SESSION_DETECTED',
         session_id: session.id,
         action: 'END_SESSION_AND_CREATE_NEW',
-        message: credCheck.message || 'Valid registered device credentials are required.',
-        boundDeviceId: null,
+        message: 'This payment session was created on another device. For security reasons, this session cannot be continued from this device.',
+        boundDeviceId,
         requestingDeviceId
       };
     }
 
-    return {
-      allowed: true,
-      shouldBind: true,
-      requestingDeviceId
-    };
-  }
-
-  // If requesting device ID is missing or does not match bound device
-  if (!requestingDeviceId || requestingDeviceId !== boundDeviceId) {
-    return {
-      allowed: false,
-      error: 'DUPLICATE_SESSION_DETECTED',
-      session_id: session.id,
-      action: 'END_SESSION_AND_CREATE_NEW',
-      message: 'This payment session was created on another device. For security reasons, this session cannot be continued from this device.',
-      boundDeviceId,
-      requestingDeviceId: requestingDeviceId || null
-    };
-  }
-
-  // Verify the bound device is registered, active, and that the caller supplied a valid token or signature
-  const credCheck = verifyRegisteredDeviceCredentials({
-    deviceId: boundDeviceId,
-    deviceToken,
-    deviceSignature,
-    signaturePayload,
-    deviceRepo
+    return { allowed: true, boundDeviceId, requestingDeviceId };
   });
-
-  if (!credCheck.valid) {
-    if (credCheck.error === 'DEVICE_REVOKED') {
-      return {
-        allowed: false,
-        error: 'DEVICE_REVOKED',
-        session_id: session.id,
-        action: 'END_SESSION_AND_CREATE_NEW',
-        message: 'The device registered for this payment session has been revoked or is invalid.'
-      };
-    }
-    if (credCheck.error === 'DEVICE_SIGNATURE_INVALID') {
-      return {
-        allowed: false,
-        error: 'DEVICE_SIGNATURE_INVALID',
-        session_id: session.id,
-        action: 'END_SESSION_AND_CREATE_NEW',
-        message: 'Device cryptographic signature failed verification.'
-      };
-    }
-    return {
-      allowed: false,
-      error: 'DUPLICATE_SESSION_DETECTED',
-      session_id: session.id,
-      action: 'END_SESSION_AND_CREATE_NEW',
-      message: 'This payment session was created on another device. For security reasons, this session cannot be continued from this device.',
-      boundDeviceId,
-      requestingDeviceId
-    };
-  }
-
-  return {
-    allowed: true,
-    boundDeviceId,
-    requestingDeviceId
-  };
 }

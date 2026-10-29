@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { hashPassword, verifyPassword, normalizeEmail, normalizeMobile, isValidEmail, isValidMobile, isValidPassword, safeEqual, encryptAtRest, decryptAtRest } from '@youpi/common';
+import { mapMaybe, runMaybe } from '../maybe.js';
 
 /** Wrong guesses tolerated per issued OTP before the challenge is burned. */
 const OTP_MAX_ATTEMPTS = 5;
@@ -63,7 +64,7 @@ export class CustomerRepository {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    this.db.execute(sql, [
+    return mapMaybe(this.db.execute(sql, [
       id,
       name,
       email,
@@ -75,9 +76,7 @@ export class CustomerRepository {
       status,
       now,
       now
-    ]);
-
-    return this.findById(id);
+    ]), () => this.findById(id));
   }
 
   /**
@@ -87,9 +86,7 @@ export class CustomerRepository {
    */
   findById(id) {
     if (!id) return null;
-    const row = this.db.queryOne('SELECT * FROM customers WHERE id = ?', [id]);
-    if (!row) return null;
-    return this.mapRow(row);
+    return mapMaybe(this.db.queryOne('SELECT * FROM customers WHERE id = ?', [id]), row => row ? this.mapRow(row) : null);
   }
 
   /**
@@ -100,9 +97,7 @@ export class CustomerRepository {
   findByEmail(email) {
     const normalized = normalizeEmail(email);
     if (!normalized) return null;
-    const row = this.db.queryOne('SELECT * FROM customers WHERE email = ?', [normalized]);
-    if (!row) return null;
-    return this.mapRow(row);
+    return mapMaybe(this.db.queryOne('SELECT * FROM customers WHERE email = ?', [normalized]), row => row ? this.mapRow(row) : null);
   }
 
   /**
@@ -114,12 +109,10 @@ export class CustomerRepository {
     const normalized = normalizeMobile(mobileNumber);
     if (!normalized) return null;
     const clean10 = normalized.slice(-10);
-    const row = this.db.queryOne(
+    return mapMaybe(this.db.queryOne(
       'SELECT * FROM customers WHERE mobile_number = ? OR mobile_number = ? OR mobile_number = ? OR mobile_number LIKE ?',
       [normalized, clean10, '+91' + clean10, '%' + clean10]
-    );
-    if (!row) return null;
-    return this.mapRow(row);
+    ), row => row ? this.mapRow(row) : null);
   }
 
   /**
@@ -141,12 +134,8 @@ export class CustomerRepository {
   findByIdentifier(identifier) {
     if (!identifier) return null;
     const trimmed = String(identifier).trim();
-    if (trimmed.includes('@')) {
-      return this.findByEmail(trimmed);
-    }
-    const asMobile = this.findByMobile(trimmed);
-    if (asMobile) return asMobile;
-    return this.findByEmail(trimmed);
+    if (trimmed.includes('@')) return this.findByEmail(trimmed);
+    return mapMaybe(this.findByMobile(trimmed), asMobile => asMobile || this.findByEmail(trimmed));
   }
 
   /**
@@ -165,24 +154,21 @@ export class CustomerRepository {
     }
 
     if (!identifier || !password) return null;
+    const repository = this;
+    return runMaybe(function* () {
+      const customer = yield repository.findByIdentifier(identifier);
+      if (!customer || customer.status !== 'ACTIVE') return null;
+      if (!verifyPassword(password, customer.passwordHash)) return null;
 
-    const customer = this.findByIdentifier(identifier);
-    if (!customer) return null;
+      const now = new Date().toISOString();
+      try {
+        yield repository.db.execute('UPDATE customers SET last_login_at = ?, updated_at = ? WHERE id = ?', [now, now, customer.id]);
+      } catch {}
 
-    if (customer.status !== 'ACTIVE') return null;
-
-    const isValid = verifyPassword(password, customer.passwordHash);
-    if (!isValid) return null;
-
-    // Update last_login_at
-    const now = new Date().toISOString();
-    try {
-      this.db.execute('UPDATE customers SET last_login_at = ?, updated_at = ? WHERE id = ?', [now, now, customer.id]);
-    } catch {}
-
-    const { passwordHash, ...safeCustomer } = customer;
-    safeCustomer.lastLoginAt = new Date(now);
-    return safeCustomer;
+      const { passwordHash, ...safeCustomer } = customer;
+      safeCustomer.lastLoginAt = new Date(now);
+      return safeCustomer;
+    });
   }
 
   /**
@@ -196,11 +182,10 @@ export class CustomerRepository {
     const normalized = normalizeMobile(mobileNumber);
     if (!normalized) return null;
     const now = new Date().toISOString();
-    this.db.execute(
+    return mapMaybe(this.db.execute(
       'UPDATE customers SET otp_code = ?, otp_expires_at = ?, otp_attempts = 0, updated_at = ? WHERE mobile_number = ?',
       [encryptAtRest(otpCode), expiresAt, now, normalized]
-    );
-    return this.findByMobile(normalized);
+    ), () => this.findByMobile(normalized));
   }
 
   /**
@@ -214,43 +199,43 @@ export class CustomerRepository {
   verifyOtp(mobileNumber, otpCode) {
     const normalized = normalizeMobile(mobileNumber);
     if (!normalized || !otpCode) return null;
-    const customer = this.findByMobile(normalized);
-    if (!customer) return null;
+    const repository = this;
+    return runMaybe(function* () {
+      const customer = yield repository.findByMobile(normalized);
+      if (!customer) return null;
+      const attempts = Number(customer.otpAttempts || 0);
+      if (attempts >= OTP_MAX_ATTEMPTS) return null;
 
-    // A 6-digit code has a 10^6 keyspace and a 5 minute lifetime, so without an attempt
-    // budget it is brute-forceable online. Fail closed once the budget is spent.
-    const attempts = Number(customer.otpAttempts || 0);
-    if (attempts >= OTP_MAX_ATTEMPTS) return null;
+      const submitted = String(otpCode).trim();
+      const storedOtp = decryptAtRest(customer.otpCode);
+      const matches = storedOtp ? safeEqual(storedOtp, submitted) : false;
+      if (!storedOtp || !matches) {
+        yield repository.db.execute(
+          'UPDATE customers SET otp_attempts = ?, updated_at = ? WHERE id = ?',
+          [attempts + 1, new Date().toISOString(), customer.id]
+        );
+        return null;
+      }
+      if (customer.otpExpiresAt && new Date() > customer.otpExpiresAt) return null;
 
-    const submitted = String(otpCode).trim();
-    const storedOtp = decryptAtRest(customer.otpCode);
-    // `!==` short-circuits on the first differing character; use a constant-time compare.
-    const matches = storedOtp ? safeEqual(storedOtp, submitted) : false;
-    if (!storedOtp || !matches) {
-      this.db.execute(
-        'UPDATE customers SET otp_attempts = ?, updated_at = ? WHERE id = ?',
-        [attempts + 1, new Date().toISOString(), customer.id]
+      const now = new Date().toISOString();
+      yield repository.db.execute(
+        'UPDATE customers SET otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, is_phone_verified = 1, last_login_at = ?, updated_at = ? WHERE id = ?',
+        [now, now, customer.id]
       );
-      return null;
-    }
-    if (customer.otpExpiresAt && new Date() > customer.otpExpiresAt) {
-      return null; // Expired
-    }
-
-    const now = new Date().toISOString();
-    this.db.execute(
-      'UPDATE customers SET otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, is_phone_verified = 1, last_login_at = ?, updated_at = ? WHERE id = ?',
-      [now, now, customer.id]
-    );
-    return this.findById(customer.id);
+      return yield repository.findById(customer.id);
+    });
   }
 
   /**
    * Completely wipes all customer identity records.
    */
   clearAll() {
-    this.db.execute('DELETE FROM customer_sessions');
-    this.db.execute('DELETE FROM customers');
+    const repository = this;
+    return runMaybe(function* () {
+      yield repository.db.execute('DELETE FROM customer_sessions');
+      yield repository.db.execute('DELETE FROM customers');
+    });
   }
 
   /**
@@ -258,8 +243,7 @@ export class CustomerRepository {
    * @returns {number}
    */
   count() {
-    const row = this.db.queryOne('SELECT COUNT(*) as c FROM customers');
-    return row?.c || 0;
+    return mapMaybe(this.db.queryOne('SELECT COUNT(*) as c FROM customers'), row => row?.c || 0);
   }
 
   /**
@@ -278,43 +262,46 @@ export class CustomerRepository {
   banCustomer(id, reason = 'FRAUDULENT_PAYMENT_INJECTION', options = {}) {
     if (!id) return null;
     const releasedAccounts = [];
-    this.db.transaction(() => {
+    const repository = this;
+    return mapMaybe(this.db.transaction(() => runMaybe(function* () {
       const now = new Date().toISOString();
       const lastDevice = options.lastDevice || options.deviceInfo || null;
-      this.db.execute(
+      yield repository.db.execute(
         "UPDATE customers SET status = 'BANNED', ban_reason = ?, banned_at = ?, last_device = COALESCE(?, last_device), updated_at = ? WHERE id = ?",
         [reason, now, lastDevice, now, id]
       );
 
-      // Immediately transition all existing non-terminal sessions for this customer to EXPIRED
-      const activeSessions = this.db.query(
+      const activeSessions = yield repository.db.query(
         "SELECT id, receiving_account_id FROM payment_sessions WHERE customer_id = ? AND status IN ('INITIATED', 'QUEUED', 'ACTIVE', 'PROCESSING')",
         [id]
       );
       if (activeSessions.length > 0) {
-        this.db.execute(
+        yield repository.db.execute(
           "UPDATE payment_sessions SET status = 'EXPIRED', completed_at = ?, updated_at = ? WHERE customer_id = ? AND status IN ('INITIATED', 'QUEUED', 'ACTIVE', 'PROCESSING')",
           [now, now, id]
         );
-        for (const s of activeSessions) {
-          if (s.receiving_account_id) {
-            this.db.execute(
+        for (const session of activeSessions) {
+          yield repository.db.execute(`
+            INSERT OR IGNORE INTO payment_webhook_outbox (payment_id, event_type, created_at)
+            VALUES (?, 'EXPIRED', ?)
+          `, [session.id, now]);
+          if (session.receiving_account_id) {
+            yield repository.db.execute(
               "UPDATE payment_receiving_accounts SET is_slot_busy = 0, current_active_session_id = NULL, updated_at = ? WHERE id = ? AND current_active_session_id = ?",
-              [now, s.receiving_account_id, s.id]
+              [now, session.receiving_account_id, session.id]
             );
-            releasedAccounts.push(s.receiving_account_id);
+            releasedAccounts.push(session.receiving_account_id);
           }
         }
       }
+    })), () => {
+      const promotion = options.queueEngine && typeof options.queueEngine.promoteNext === 'function'
+        ? runMaybe(function* () {
+          for (const accountId of releasedAccounts) yield options.queueEngine.promoteNext(accountId);
+        })
+        : undefined;
+      return mapMaybe(promotion, () => repository.findById(id));
     });
-
-    if (options.queueEngine && typeof options.queueEngine.promoteNext === 'function') {
-      for (const accountId of releasedAccounts) {
-        options.queueEngine.promoteNext(accountId);
-      }
-    }
-
-    return this.findById(id);
   }
 
   /**
@@ -325,11 +312,10 @@ export class CustomerRepository {
   unbanCustomer(id) {
     if (!id) return null;
     const now = new Date().toISOString();
-    this.db.execute(
+    return mapMaybe(this.db.execute(
       "UPDATE customers SET status = 'ACTIVE', ban_reason = NULL, unbanned_at = ?, updated_at = ? WHERE id = ?",
       [now, now, id]
-    );
-    return this.findById(id);
+    ), () => this.findById(id));
   }
 
   /**
@@ -339,8 +325,7 @@ export class CustomerRepository {
    */
   isBanned(id) {
     if (!id) return false;
-    const customer = this.findById(id);
-    return customer?.status === 'BANNED';
+    return mapMaybe(this.findById(id), customer => customer?.status === 'BANNED');
   }
 
   /**
@@ -376,7 +361,7 @@ export class CustomerRepository {
         fraud_reason, metadata, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
-    this.db.execute(sql, [
+    return mapMaybe(this.db.execute(sql, [
       id,
       data.merchantId || null,
       data.customerId || null,
@@ -394,8 +379,7 @@ export class CustomerRepository {
       data.fraudReason || 'FRAUDULENT_PAYMENT_INJECTION',
       typeof data.metadata === 'object' ? JSON.stringify(data.metadata) : (data.metadata || '{}'),
       now
-    ]);
-    return this.db.queryOne('SELECT * FROM security_events WHERE id = ?', [id]);
+    ]), () => this.db.queryOne('SELECT * FROM security_events WHERE id = ?', [id]));
   }
 
   /**
@@ -426,17 +410,15 @@ export class CustomerRepository {
     };
 
     if (customerId) {
-      const rows = this.db.query(
+      return mapMaybe(this.db.query(
         'SELECT * FROM security_events WHERE customer_id = ? ORDER BY created_at DESC LIMIT ?',
         [customerId, limit]
-      );
-      return rows.map(mapSecRow);
+      ), rows => rows.map(mapSecRow));
     }
-    const rows = this.db.query(
+    return mapMaybe(this.db.query(
       'SELECT se.*, c.name as customer_name, c.email as customer_email, c.mobile_number as customer_phone FROM security_events se LEFT JOIN customers c ON se.customer_id = c.id ORDER BY se.created_at DESC LIMIT ?',
       [limit]
-    );
-    return rows.map(mapSecRow);
+    ), rows => rows.map(mapSecRow));
   }
 
   /**
@@ -474,8 +456,7 @@ export class CustomerRepository {
     }
     sql += ` GROUP BY c.id ORDER BY COALESCE(c.banned_at, c.updated_at) DESC`;
 
-    const rows = this.db.query(sql, params);
-    return rows.map(r => ({
+    return mapMaybe(this.db.query(sql, params), rows => rows.map(r => ({
       id: r.id,
       name: r.name,
       email: r.email,
@@ -491,7 +472,7 @@ export class CustomerRepository {
       source: r.event_source || 'SMS',
       securityEventId: r.security_event_id || null,
       rawMessage: r.event_raw_message || null
-    }));
+    })));
   }
 
   /**
@@ -500,21 +481,22 @@ export class CustomerRepository {
    * @returns {any | null}
    */
   getBanEvidence(customerId) {
-    const customer = this.findById(customerId);
+    return runMaybe(function* () {
+    const customer = yield this.findById(customerId);
     if (!customer) return null;
 
-    const events = this.getSecurityEvents(customerId, 50);
+    const events = yield this.getSecurityEvents(customerId, 50);
     const triggerEvent = events.find(e => e.eventType === 'FRAUDULENT_PAYMENT_INJECTION') || events[0] || null;
 
     let session = null;
     if (triggerEvent?.paymentSessionId || triggerEvent?.payment_session_id) {
       const sessId = triggerEvent.paymentSessionId || triggerEvent.payment_session_id;
-      session = this.db.queryOne('SELECT * FROM payment_sessions WHERE id = ?', [sessId]);
+      session = yield this.db.queryOne('SELECT * FROM payment_sessions WHERE id = ?', [sessId]);
     } else {
-      session = this.db.queryOne('SELECT * FROM payment_sessions WHERE customer_id = ? ORDER BY created_at DESC LIMIT 1', [customerId]);
+      session = yield this.db.queryOne('SELECT * FROM payment_sessions WHERE customer_id = ? ORDER BY created_at DESC LIMIT 1', [customerId]);
     }
 
-    const allSessions = this.db.query(
+    const allSessions = yield this.db.query(
       'SELECT status, amount_paise FROM payment_sessions WHERE customer_id = ?',
       [customerId]
     );
@@ -605,6 +587,7 @@ export class CustomerRepository {
         rawMessage: e.rawMessage || e.raw_message
       }))
     };
+    }.bind(this));
   }
 
   /**

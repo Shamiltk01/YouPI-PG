@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { AuditActorType } from '@youpi/common';
+import { mapMaybe } from '../maybe.js';
 
 export class AuditLogRepository {
   /**
@@ -19,7 +20,7 @@ export class AuditLogRepository {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    this.db.execute(sql, [
+    return mapMaybe(this.db.execute(sql, [
       id,
       data.merchantId || null,
       data.entityType,
@@ -30,25 +31,21 @@ export class AuditLogRepository {
       details,
       data.ipAddress || null,
       now
-    ]);
-
-    return id;
+    ]), () => id);
   }
 
   findByEntity(entityType, entityId) {
-    const rows = this.db.query(
+    return mapMaybe(this.db.query(
       'SELECT * FROM audit_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC',
       [entityType, entityId]
-    );
-    return rows.map(r => this.mapRow(r));
+    ), rows => rows.map(r => this.mapRow(r)));
   }
 
   findByMerchant(merchantId, limit = 100) {
-    const rows = this.db.query(
+    return mapMaybe(this.db.query(
       'SELECT * FROM audit_logs WHERE merchant_id = ? ORDER BY created_at DESC LIMIT ?',
       [merchantId, limit]
-    );
-    return rows.map(r => this.mapRow(r));
+    ), rows => rows.map(r => this.mapRow(r)));
   }
 
   mapRow(row) {

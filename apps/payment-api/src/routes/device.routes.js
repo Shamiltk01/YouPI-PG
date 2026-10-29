@@ -10,7 +10,7 @@ import {
 /**
  * Resolves a verified customer ID strictly from a valid customer session token.
  */
-function resolveAuthenticatedCustomerId(req, body, ctx) {
+async function resolveAuthenticatedCustomerId(req, body, ctx) {
   if (!ctx.customerSessionRepo) return null;
   let token = body?.token || req.headers['x-customer-token'] || null;
   if (!token) {
@@ -20,7 +20,7 @@ function resolveAuthenticatedCustomerId(req, body, ctx) {
     }
   }
   if (!token || typeof token !== 'string') return null;
-  const authCtx = ctx.customerSessionRepo.findByToken(token.trim());
+  const authCtx = await ctx.customerSessionRepo.findByToken(token.trim());
   return authCtx?.customer?.id || null;
 }
 
@@ -46,8 +46,8 @@ export function registerDeviceRoutes(server, ctx) {
     }
 
     const existing = publicKey
-      ? ctx.deviceRepo.findByPublicKey(String(publicKey).trim())
-      : ctx.deviceRepo.findById(String(deviceId).trim());
+      ? await ctx.deviceRepo.findByPublicKey(String(publicKey).trim())
+      : await ctx.deviceRepo.findById(String(deviceId).trim());
 
     if (!existing || existing.status !== 'ACTIVE') {
       HttpServer.json(res, 404, { error: 'Device not found or inactive' });
@@ -91,10 +91,10 @@ export function registerDeviceRoutes(server, ctx) {
     const normalized = normalizeDeviceSignals(clientSignals);
 
     // Optional customer association strictly from verified customer session token (never bare customerId)
-    const customerId = resolveAuthenticatedCustomerId(req, body, ctx);
+    const customerId = await resolveAuthenticatedCustomerId(req, body, ctx);
 
     // Check if device with this exact public key already exists
-    const existing = ctx.deviceRepo.findByPublicKey(trimmedPublicKey);
+    const existing = await ctx.deviceRepo.findByPublicKey(trimmedPublicKey);
     if (existing) {
       if (existing.status !== 'ACTIVE') {
         HttpServer.json(res, 403, { error: 'DEVICE_REVOKED', message: 'Device has been revoked or deactivated.' });
@@ -141,10 +141,10 @@ export function registerDeviceRoutes(server, ctx) {
       }
 
       if (customerId && !existing.customerId) {
-        ctx.deviceRepo.associateCustomer(existing.id, customerId);
+        await ctx.deviceRepo.associateCustomer(existing.id, customerId);
       }
-      ctx.deviceRepo.touch(existing.id);
-      const rotatedToken = ctx.deviceRepo.rotateToken(existing.id);
+      await ctx.deviceRepo.touch(existing.id);
+      const rotatedToken = await ctx.deviceRepo.rotateToken(existing.id);
 
       HttpServer.json(res, 200, {
         success: true,
@@ -158,7 +158,7 @@ export function registerDeviceRoutes(server, ctx) {
     }
 
     // Register new device
-    const device = ctx.deviceRepo.create({
+    const device = await ctx.deviceRepo.create({
       customerId,
       publicKey: trimmedPublicKey,
       fingerprintHash,
@@ -171,7 +171,7 @@ export function registerDeviceRoutes(server, ctx) {
     });
 
     if (ctx.auditRepo) {
-      ctx.auditRepo.log({
+      await ctx.auditRepo.log({
         entityType: 'DEVICE',
         entityId: device.id,
         action: 'DEVICE_REGISTERED',
@@ -205,7 +205,7 @@ export function registerDeviceRoutes(server, ctx) {
       return;
     }
 
-    const device = ctx.deviceRepo.findById(deviceId);
+    const device = await ctx.deviceRepo.findById(deviceId);
     if (!device || device.status !== 'ACTIVE' || (typeof device.publicKey === 'string' && device.publicKey.startsWith('adhoc_'))) {
       HttpServer.json(res, 404, { valid: false, error: 'Device not found or inactive' });
       return;
@@ -240,7 +240,7 @@ export function registerDeviceRoutes(server, ctx) {
       return;
     }
 
-    const tokenValid = hasToken ? ctx.deviceRepo.verifyToken(device.id, deviceToken.trim()) : true;
+    const tokenValid = hasToken ? await ctx.deviceRepo.verifyToken(device.id, deviceToken.trim()) : true;
     const signatureValid = hasSig
       ? verifyDeviceSignature(device.publicKey, payload, signature, { expectedDeviceId: device.id })
       : true;
@@ -258,7 +258,7 @@ export function registerDeviceRoutes(server, ctx) {
 
   // 3. GET /api/v1/devices/:id
   server.get('/api/v1/devices/:id', async (req, res, params) => {
-    const device = ctx.deviceRepo.findById(params.id);
+    const device = await ctx.deviceRepo.findById(params.id);
     if (!device) {
       HttpServer.json(res, 404, { error: 'Device not found' });
       return;
@@ -279,7 +279,7 @@ export function registerDeviceRoutes(server, ctx) {
 
   // 4. GET /api/v1/devices/customer/:customerId
   server.get('/api/v1/devices/customer/:customerId', async (req, res, params) => {
-    const devices = ctx.deviceRepo.findByCustomerId(params.customerId);
+    const devices = await ctx.deviceRepo.findByCustomerId(params.customerId);
     HttpServer.json(res, 200, {
       customerId: params.customerId,
       count: devices.length,

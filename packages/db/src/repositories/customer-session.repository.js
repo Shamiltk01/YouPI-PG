@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { blindIndex } from '@youpi/common';
+import { mapMaybe, runMaybe } from '../maybe.js';
 
 /** Namespace so session-token and device-token digests can never collide. */
 const INDEX_NS = 'csess';
@@ -38,7 +39,7 @@ export class CustomerSessionRepository {
     // The bearer token is returned to the client once and never read back from the database,
     // so only a keyed blind index is stored. A database dump therefore cannot be replayed
     // as valid sessions, which a plaintext (or plain-hashed) column would allow.
-    this.db.execute(sql, [
+    return mapMaybe(this.db.execute(sql, [
       id,
       data.customerId,
       blindIndex(token, INDEX_NS),
@@ -47,16 +48,14 @@ export class CustomerSessionRepository {
       data.userAgent || null,
       now.toISOString(),
       now.toISOString()
-    ]);
-
-    return {
+    ]), () => ({
       id,
       customerId: data.customerId,
       token,
       expiresAt,
       isActive: true,
       createdAt: now
-    };
+    }));
   }
 
   /**
@@ -66,72 +65,65 @@ export class CustomerSessionRepository {
    */
   findByToken(token) {
     if (!token || typeof token !== 'string') return null;
-
-    const row = this.db.queryOne(
-      'SELECT * FROM customer_sessions WHERE token = ? AND is_active = 1',
-      [blindIndex(token, INDEX_NS)]
-    );
-
-    // Rows written before index-only storage held the raw token.
-    if (!row && typeof token === 'string' && token.startsWith('csess_') && token.length < 100) {
-      const legacy = this.db.queryOne(
+    const repository = this;
+    return runMaybe(function* () {
+      let row = yield repository.db.queryOne(
         'SELECT * FROM customer_sessions WHERE token = ? AND is_active = 1',
-        [token]
+        [blindIndex(token, INDEX_NS)]
       );
-      if (legacy) {
-        // Re-index on first successful use so the plaintext row does not linger.
+
+      if (!row && token.startsWith('csess_') && token.length < 100) {
+        const legacy = yield repository.db.queryOne(
+          'SELECT * FROM customer_sessions WHERE token = ? AND is_active = 1',
+          [token]
+        );
+        if (legacy) {
+          try {
+            yield repository.db.execute('UPDATE customer_sessions SET token = ? WHERE id = ?', [blindIndex(token, INDEX_NS), legacy.id]);
+          } catch {}
+          return yield repository.findByToken(token);
+        }
+      }
+
+      if (!row) return null;
+      const expiresAt = new Date(row.expires_at);
+      if (expiresAt.getTime() <= Date.now()) {
         try {
-          this.db.execute('UPDATE customer_sessions SET token = ? WHERE id = ?', [blindIndex(token, INDEX_NS), legacy.id]);
+          yield repository.db.execute('UPDATE customer_sessions SET is_active = 0, updated_at = ? WHERE id = ?', [
+            new Date().toISOString(),
+            row.id
+          ]);
         } catch {}
-        return this.findByToken(token);
+        return null;
       }
-    }
 
-    if (!row) return null;
-
-    const expiresAt = new Date(row.expires_at);
-    if (expiresAt.getTime() <= Date.now()) {
-      // Mark expired
-      try {
-        this.db.execute('UPDATE customer_sessions SET is_active = 0, updated_at = ? WHERE id = ?', [
-          new Date().toISOString(),
-          row.id
-        ]);
-      } catch {}
-      return null;
-    }
-
-    const session = {
-      id: row.id,
-      customerId: row.customer_id,
-      expiresAt,
-      isActive: Boolean(row.is_active),
-      createdAt: new Date(row.created_at)
-    };
-
-    let customer = null;
-    if (this.customerRepo) {
-      customer = this.customerRepo.findById(row.customer_id);
-    } else {
-      const custRow = this.db.queryOne('SELECT * FROM customers WHERE id = ?', [row.customer_id]);
-      if (custRow) {
-        customer = {
-          id: custRow.id,
-          name: custRow.name,
-          email: custRow.email,
-          mobileNumber: custRow.mobile_number,
-          status: custRow.status,
-          createdAt: new Date(custRow.created_at),
-          updatedAt: new Date(custRow.updated_at)
-        };
+      const session = {
+        id: row.id,
+        customerId: row.customer_id,
+        expiresAt,
+        isActive: Boolean(row.is_active),
+        createdAt: new Date(row.created_at)
+      };
+      let customer = null;
+      if (repository.customerRepo) {
+        customer = yield repository.customerRepo.findById(row.customer_id);
+      } else {
+        const custRow = yield repository.db.queryOne('SELECT * FROM customers WHERE id = ?', [row.customer_id]);
+        if (custRow) {
+          customer = {
+            id: custRow.id,
+            name: custRow.name,
+            email: custRow.email,
+            mobileNumber: custRow.mobile_number,
+            status: custRow.status,
+            createdAt: new Date(custRow.created_at),
+            updatedAt: new Date(custRow.updated_at)
+          };
+        }
       }
-    }
-
-    if (!customer || customer.status !== 'ACTIVE') {
-      return null;
-    }
-
-    return { session, customer };
+      if (!customer || customer.status !== 'ACTIVE') return null;
+      return { session, customer };
+    });
   }
 
   /**
@@ -141,17 +133,19 @@ export class CustomerSessionRepository {
    */
   revokeToken(token) {
     if (!token) return false;
-    const now = new Date().toISOString();
-    this.db.execute(
-      'UPDATE customer_sessions SET is_active = 0, updated_at = ? WHERE token = ?',
-      [now, blindIndex(token, INDEX_NS)]
-    );
-    // Also clear any legacy plaintext row so logout always revokes.
-    this.db.execute(
-      'UPDATE customer_sessions SET is_active = 0, updated_at = ? WHERE token = ?',
-      [now, token]
-    );
-    return true;
+    const repository = this;
+    return runMaybe(function* () {
+      const now = new Date().toISOString();
+      yield repository.db.execute(
+        'UPDATE customer_sessions SET is_active = 0, updated_at = ? WHERE token = ?',
+        [now, blindIndex(token, INDEX_NS)]
+      );
+      yield repository.db.execute(
+        'UPDATE customer_sessions SET is_active = 0, updated_at = ? WHERE token = ?',
+        [now, token]
+      );
+      return true;
+    });
   }
 
   /**
@@ -161,7 +155,7 @@ export class CustomerSessionRepository {
   revokeAllForCustomer(customerId) {
     if (!customerId) return;
     const now = new Date().toISOString();
-    this.db.execute(
+    return this.db.execute(
       'UPDATE customer_sessions SET is_active = 0, updated_at = ? WHERE customer_id = ?',
       [now, customerId]
     );
@@ -172,10 +166,9 @@ export class CustomerSessionRepository {
    * @returns {number}
    */
   countActive() {
-    const row = this.db.queryOne(
+    return mapMaybe(this.db.queryOne(
       'SELECT COUNT(*) as c FROM customer_sessions WHERE is_active = 1 AND expires_at > ?',
       [new Date().toISOString()]
-    );
-    return row?.c || 0;
+    ), row => row?.c || 0);
   }
 }
