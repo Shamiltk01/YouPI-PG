@@ -54,6 +54,8 @@ describe('Merchant Admin Integration Tests', () => {
     assert.ok(res.text.includes('Payment Observers (SMS & Gmail)'));
     assert.ok(res.text.includes('Android SMS Gateway'));
     assert.ok(res.text.includes('Gmail Direct API'));
+    assert.ok(res.text.includes('data-youpi-key="${currentMerchantId}"><\\/script>`;'));
+    assert.equal((res.text.match(/<\/script>/gi) || []).length, 3);
   });
 
   test('GET /api/admin/tickets requires the admin token', async () => {
