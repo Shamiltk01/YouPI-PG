@@ -7873,9 +7873,24 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ businessName: name, slug, vpa, contactEmail, contactPhone, webhookUrl })
         });
-        const data = await res.json();
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.toLowerCase().includes('application/json')) {
+          showAdminToast(`Merchant creation could not be confirmed (HTTP ${res.status}). The server returned a non-JSON response. Check Vercel runtime logs and the merchant list before retrying.`, false);
+          return;
+        }
+        let data;
+        try {
+          data = await res.json();
+        } catch {
+          showAdminToast(`Merchant creation could not be confirmed (HTTP ${res.status}). The server returned invalid JSON. Check Vercel runtime logs and the merchant list before retrying.`, false);
+          return;
+        }
         if (!res.ok) {
-          showAdminToast(data.error || 'Failed to create merchant.', false);
+          showAdminToast(data?.error || `Failed to create merchant (HTTP ${res.status}).`, false);
+          return;
+        }
+        if (!data?.merchant?.id) {
+          showAdminToast('Merchant creation could not be confirmed. The server response is missing the merchant ID. Check the merchant list before retrying.', false);
           return;
         }
 

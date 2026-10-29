@@ -20,6 +20,11 @@ const cache = new Map();
 export function resolveSecret(name, envVar) {
   const fromEnv = envVar ? (process.env[envVar] || '').trim() : '';
   if (fromEnv) return fromEnv;
+  if (process.env.VERCEL) {
+    const error = new Error(`${envVar || name} must be configured as a stable environment variable on Vercel; local secret files are not supported.`);
+    error.code = 'MISSING_SERVERLESS_SECRET';
+    throw error;
+  }
   if (cache.has(name)) return cache.get(name);
 
   const file = path.join(SECRETS_DIR, name);

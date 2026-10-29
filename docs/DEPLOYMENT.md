@@ -226,6 +226,8 @@ For COD, a successful order event is not evidence that money was received.
 | Symptom | Check |
 | :--- | :--- |
 | Admin token repeatedly rejected (`401`) | Same `ADMIN_API_TOKEN` on the intended environment and all relevant services; redeploy after changes |
+| `FUNCTION_INVOCATION_FAILED` with `mkdir '/var/task/data/.secrets'` in logs | A required secret is unset. `getCoinStoreWebhookSecret` in the stack means `COIN_STORE_WEBHOOK_SECRET` is missing. Configure it and the other stable secrets from Step 2 in the deployment's environment, then redeploy. Preserve the existing `ENCRYPTION_MASTER_KEY` used for that database |
+| `PAYMENT_API_STARTUP_FAILED` / `MISSING_SERVERLESS_SECRET` | Inspect Vercel runtime logs for the named missing environment variable; do not generate temporary per-instance secrets or reset the database |
 | New merchant rejected (`409`) | Slug already exists; choose a different slug |
 | New merchant rejected (`400`) | Required business name or invalid/blocked webhook URL; inspect the response error |
 | Merchant create succeeds (`201`) but UI appears unchanged | Deployed revision includes the settings-loader fix; inspect subsequent merchant-list and merchant-settings responses |

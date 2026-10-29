@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import { Database } from '@youpi/db';
 import { startServer as startPaymentApi } from '../index.js';
 import { authFetch } from '../../../../scripts/test-support.js';
+import { createVercelHandler } from '../../vercel-entrypoint.js';
 
 describe('Merchant Management & Multi-Tenant Onboarding Test Suite', () => {
   let apiInstance;
@@ -35,6 +36,51 @@ describe('Merchant Management & Multi-Tenant Onboarding Test Suite', () => {
     assert.ok(body.merchants.length >= 1, 'At least 1 default merchant must exist');
     const defaultM = body.merchants.find(m => m.id === '00000000-0000-0000-0000-000000000001');
     assert.ok(defaultM, 'Default merchant 00000000-0000-0000-0000-000000000001 must exist');
+  });
+
+  it('Vercel entrypoint reports startup failures safely and retries initialization on a later request', async context => {
+    const errors = [];
+    context.mock.method(console, 'error', (...args) => errors.push(args));
+    let attempts = 0;
+    const handler = createVercelHandler(async () => {
+      attempts++;
+      if (attempts === 1) throw new Error('private startup details');
+      return { rawServer: { emit: (event, req, res) => { res.end('ready'); return true; } } };
+    });
+    const invoke = async () => {
+      const response = {};
+      await handler({}, {
+        writeHead: (status, headers) => { response.status = status; response.headers = headers; },
+        end: body => { response.body = body; }
+      });
+      return response;
+    };
+    const failed = await invoke();
+    assert.equal(failed.status, 503);
+    assert.match(failed.headers['Content-Type'], /application\/json/);
+    assert.equal(JSON.parse(failed.body).code, 'PAYMENT_API_STARTUP_FAILED');
+    assert.ok(!failed.body.includes('private startup details'));
+    assert.equal(errors.length, 1);
+    assert.equal((await invoke()).body, 'ready');
+    assert.equal((await invoke()).body, 'ready');
+    assert.equal(attempts, 2);
+  });
+
+  it('Vercel entrypoint shares initialization across concurrent requests', async () => {
+    let attempts = 0;
+    let ready;
+    const handler = createVercelHandler(() => {
+      attempts++;
+      return new Promise(resolve => { ready = resolve; });
+    });
+    const responses = [];
+    const first = handler({}, { end: body => responses.push(body) });
+    const second = handler({}, { end: body => responses.push(body) });
+    await new Promise(setImmediate);
+    assert.equal(attempts, 1);
+    ready({ rawServer: { emit: (event, req, res) => { res.end('ready'); return true; } } });
+    await Promise.all([first, second]);
+    assert.deepEqual(responses, ['ready', 'ready']);
   });
 
   it('2. POST /api/v1/admin/merchants rejects request with missing businessName', async () => {
@@ -222,5 +268,30 @@ describe('Merchant Management & Multi-Tenant Onboarding Test Suite', () => {
     assert.equal(posts, 2);
     assert.match(toasts.at(-1).message, /Name is required/);
     assert.equal(modalOpen, true);
+
+    elements.modalMerchantName.value = 'Retry Test Store';
+    for (const [status, contentType, body, expectedMessage] of [
+      [500, 'text/html', '<html>FUNCTION_INVOCATION_FAILED private server details</html>', /HTTP 500.*non-JSON/],
+      [502, 'application/json', '{not-valid-json', /HTTP 502.*invalid JSON/],
+      [201, 'application/json', '{}', /missing the merchant ID/]
+    ]) {
+      let failedRequests = 0;
+      const before = toasts.length;
+      context.fetch = async () => {
+        failedRequests++;
+        return new Response(body, { status, headers: { 'Content-Type': contentType } });
+      };
+      await context.submitNewMerchant();
+      assert.equal(failedRequests, 1);
+      assert.equal(toasts.length, before + 1);
+      assert.equal(toasts.at(-1).success, false);
+      assert.match(toasts.at(-1).message, expectedMessage);
+      assert.ok(!toasts.at(-1).message.includes('private server details'));
+      assert.ok(!toasts.at(-1).message.includes('Unexpected token'));
+      assert.equal(modalOpen, true);
+      assert.equal(elements.createMerchantButton.disabled, false);
+      assert.equal(elements.createMerchantButton.textContent, 'Create Merchant');
+      assert.equal(elements.modalMerchantName.value, 'Retry Test Store');
+    }
   });
 });

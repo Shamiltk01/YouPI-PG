@@ -1,5 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { getCoinStoreWebhookSecret } from '../secrets.js';
 import {
   buildCloudflaredInvocation,
   safeEqual,
@@ -55,6 +57,31 @@ describe('@youpi/common Unit Tests', () => {
 
   describe('Cryptographic Helpers', () => {
     const testMasterKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+    test('Vercel requires stable configured secrets without reading or creating local secret files', context => {
+      const originalVercel = process.env.VERCEL;
+      const originalSecret = process.env.COIN_STORE_WEBHOOK_SECRET;
+      const read = context.mock.method(fs, 'readFileSync', () => 'bundled-secret');
+      const mkdir = context.mock.method(fs, 'mkdirSync', () => { throw new Error('Must not create a secrets directory'); });
+      try {
+        process.env.VERCEL = '1';
+        delete process.env.COIN_STORE_WEBHOOK_SECRET;
+        assert.throws(() => getCoinStoreWebhookSecret(), error => {
+          assert.equal(error.code, 'MISSING_SERVERLESS_SECRET');
+          assert.match(error.message, /COIN_STORE_WEBHOOK_SECRET must be configured/);
+          return true;
+        });
+        process.env.COIN_STORE_WEBHOOK_SECRET = 'test-configured-webhook-secret';
+        assert.equal(getCoinStoreWebhookSecret(), 'test-configured-webhook-secret');
+        assert.equal(read.mock.callCount(), 0);
+        assert.equal(mkdir.mock.callCount(), 0);
+      } finally {
+        if (originalVercel === undefined) delete process.env.VERCEL;
+        else process.env.VERCEL = originalVercel;
+        if (originalSecret === undefined) delete process.env.COIN_STORE_WEBHOOK_SECRET;
+        else process.env.COIN_STORE_WEBHOOK_SECRET = originalSecret;
+      }
+    });
 
     test('encrypts and decrypts with AES-256-GCM successfully', () => {
       const original = 'super-secret-oauth-token-12345';
