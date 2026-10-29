@@ -402,7 +402,7 @@ describe('Webhook Engine Integration Tests', () => {
       assert.equal(preRow.attempt_count, 0);
 
       // Run startup recovery to reset in-flight leases and backfill any missing rows
-      const recovered = restartedWebhookEngine.recoverMissingDeliveries({ resetInFlight: true });
+      const recovered = await restartedWebhookEngine.recoverMissingDeliveries({ resetInFlight: true });
       assert.ok(recovered >= 1, 'recoverMissingDeliveries should reset the interrupted in-flight row');
 
       // Allow receiver to respond 200 OK and run retryPending()

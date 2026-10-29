@@ -2,9 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
-import { getCoinStoreWebhookSecret, LEGACY_DEFAULT_WEBHOOK_SECRET, resolveDefaultBranding } from '@youpi/common';
+import { decryptAtRest, encryptAtRest, getCoinStoreWebhookSecret, LEGACY_DEFAULT_WEBHOOK_SECRET, resolveDefaultBranding } from '@youpi/common';
 import { getDatabase } from './database.js';
-import { MerchantRepository } from './repositories/merchant.repository.js';
+import { hashApiKey, MerchantRepository } from './repositories/merchant.repository.js';
 import { ReceivingAccountRepository } from './repositories/receiving-account.repository.js';
 import { CustomerRepository } from './repositories/customer.repository.js';
 
@@ -215,6 +215,163 @@ export function runMigrations(targetDb) {
     db,
     defaultMerchant
   };
+}
+
+export function splitLayerbaseSchemaStatements(sql) {
+  const statements = [];
+  let start = 0;
+  let quote = null;
+  let lineComment = false;
+  let blockComment = false;
+
+  const addStatement = (end) => {
+    const statement = sql.slice(start, end).replace(/^\s*--[^\r\n]*$/gm, '').trim();
+    if (statement) statements.push(statement);
+  };
+
+  for (let index = 0; index < sql.length; index += 1) {
+    const character = sql[index];
+    const next = sql[index + 1];
+
+    if (lineComment) {
+      if (character === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (character === '*' && next === '/') {
+        index += 1;
+        blockComment = false;
+      }
+      continue;
+    }
+    if (quote) {
+      if (character === quote) {
+        if (next === quote) index += 1;
+        else quote = null;
+      } else if (character === '\\' && next && quote === "'") {
+        index += 1;
+      }
+      continue;
+    }
+    if (character === '-' && next === '-') {
+      index += 1;
+      lineComment = true;
+    } else if (character === '/' && next === '*') {
+      index += 1;
+      blockComment = true;
+    } else if (character === "'" || character === '"' || character === '`') {
+      quote = character;
+    } else if (character === ';') {
+      const current = sql.slice(start, index).replace(/^\s*--[^\r\n]*$/gm, '').trim();
+      const isTrigger = /^CREATE\s+TRIGGER\b/i.test(current);
+      if (!isTrigger || /\bEND\s*$/i.test(current)) {
+        addStatement(index);
+        start = index + 1;
+      }
+    }
+  }
+
+  addStatement(sql.length);
+  return statements;
+}
+
+/** Initializes a Layerbase SQLite database through its PostgreSQL wire endpoint. */
+export async function initializeLayerbaseDatabase(db) {
+  if (!db?.isLayerbase) {
+    throw new TypeError('initializeLayerbaseDatabase requires a LayerbaseDatabase instance.');
+  }
+
+  const schemaPath = path.join(__dirname, 'sqlite-schema.sql');
+  const schemaStatements = splitLayerbaseSchemaStatements(fs.readFileSync(schemaPath, 'utf8'));
+  for (const statement of schemaStatements) {
+    if (/^CREATE\s+TRIGGER\b/i.test(statement)) continue;
+
+    const tableName = statement.match(/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?([\w]+)/i)?.[1];
+    const indexName = statement.match(/^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?([\w]+)/i)?.[1];
+    const objectName = tableName || indexName;
+    if (objectName) {
+      const objectType = tableName ? 'table' : 'index';
+      const existing = await db.queryOne(
+        'SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?',
+        [objectType, objectName]
+      );
+      if (existing) continue;
+    }
+
+    const executable = statement.replace(/\bIF\s+NOT\s+EXISTS\b/i, '');
+    await db.exec(executable);
+  }
+
+  const branding = resolveDefaultBranding();
+  const businessName = process.env.DEFAULT_MERCHANT_NAME || 'YOUPI Demo Store';
+  const webhookSecret = getCoinStoreWebhookSecret();
+  const merchantId = '00000000-0000-0000-0000-000000000001';
+  const merchantBranding = JSON.stringify({
+    appName: branding.appName,
+    primaryColor: branding.primaryColor,
+    logoUrl: branding.logoUrl,
+    trustBadgeText: branding.trustBadgeText,
+    footerGuarantee: branding.footerGuarantee
+  });
+
+  await db.transaction(async () => {
+    await db.execute(`
+      INSERT OR IGNORE INTO merchants (
+        id, business_name, slug, contact_email, contact_phone, webhook_url,
+        webhook_secret, api_key_hash, branding
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      merchantId,
+      businessName,
+      process.env.DEFAULT_MERCHANT_SLUG || 'demo-store',
+      process.env.DEFAULT_SUPPORT_EMAIL || 'merchant@youpi.local',
+      process.env.DEFAULT_SUPPORT_PHONE || '9876543210',
+      process.env.COIN_STORE_WEBHOOK_URL || 'http://localhost:5000/api/webhook',
+      encryptAtRest(webhookSecret),
+      hashApiKey(webhookSecret),
+      merchantBranding
+    ]);
+
+    const storedMerchant = await db.queryOne('SELECT * FROM merchants WHERE id = ?', [merchantId]);
+    if (!storedMerchant) throw new Error('Layerbase initialization failed to create the default merchant.');
+
+    const existingSecret = decryptAtRest(storedMerchant.webhook_secret);
+    if (!existingSecret || existingSecret === LEGACY_DEFAULT_WEBHOOK_SECRET) {
+      await db.execute(`
+        UPDATE merchants
+        SET webhook_secret = ?, api_key_hash = ?, updated_at = ?
+        WHERE id = ?
+      `, [encryptAtRest(webhookSecret), hashApiKey(webhookSecret), new Date().toISOString(), merchantId]);
+    }
+
+    await db.execute(`
+      INSERT OR IGNORE INTO payment_receiving_accounts (
+        id, merchant_id, upi_id, payee_name, is_merchant_enabled, is_active
+      ) VALUES (?, ?, ?, ?, 1, 1)
+    `, [
+      '00000000-0000-0000-0000-000000000002',
+      merchantId,
+      'merchant@upi',
+      storedMerchant.business_name
+    ]);
+
+    if (process.env.YOUPI_SEED_DEMO_CUSTOMER === 'true') {
+      await db.execute(`
+        INSERT OR IGNORE INTO customers (id, name, email, mobile_number, is_phone_verified)
+        VALUES (?, ?, ?, ?, 0)
+      `, [
+        '00000000-0000-0000-0000-000000000002',
+        'Demo Customer',
+        'demo-customer@youpi.local',
+        '9000000000'
+      ]);
+    }
+  });
+
+  const defaultMerchantRow = await db.queryOne('SELECT * FROM merchants WHERE id = ?', [merchantId]);
+  const defaultMerchant = new MerchantRepository(db).mapRow(defaultMerchantRow);
+
+  return { db, defaultMerchant };
 }
 
 /**

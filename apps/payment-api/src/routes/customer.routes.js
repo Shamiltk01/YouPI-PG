@@ -157,7 +157,7 @@ export function registerCustomerRoutes(server, ctx) {
     recent.push(now);
     checkUserRateMap.set(ip, recent);
 
-    const existingUser = ctx.customerRepo.findByMobile(cleanMobile);
+    const existingUser = await ctx.customerRepo.findByMobile(cleanMobile);
 
     HttpServer.json(res, 200, {
       success: true,
@@ -192,7 +192,7 @@ export function registerCustomerRoutes(server, ctx) {
       return;
     }
 
-    const existingUser = ctx.customerRepo.findByMobile(cleanMobile);
+    const existingUser = await ctx.customerRepo.findByMobile(cleanMobile);
 
     // Throttle before doing any work: otherwise this endpoint can be used to flood a
     // customer's WhatsApp with OTPs (harassment) or burn merchant messaging credits.
@@ -212,7 +212,7 @@ export function registerCustomerRoutes(server, ctx) {
         return;
       }
       // Check unique email
-      const existingByEmail = ctx.customerRepo.findByEmail(email);
+      const existingByEmail = await ctx.customerRepo.findByEmail(email);
       if (existingByEmail) {
         HttpServer.json(res, 409, { error: 'An account with this email address already exists. Please log in.' });
         return;
@@ -224,7 +224,7 @@ export function registerCustomerRoutes(server, ctx) {
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
     if (existingUser) {
-      ctx.customerRepo.setOtp(cleanMobile, otpCode, expiresAt);
+      await ctx.customerRepo.setOtp(cleanMobile, otpCode, expiresAt);
     } else {
       pendingOtpChallenges.set(cleanMobile, {
         otpCode,
@@ -281,11 +281,11 @@ export function registerCustomerRoutes(server, ctx) {
       return;
     }
 
-    let customer = ctx.customerRepo.findByMobile(cleanMobile);
+    let customer = await ctx.customerRepo.findByMobile(cleanMobile);
 
     if (customer) {
       // Existing User Verification
-      const verified = ctx.customerRepo.verifyOtp(cleanMobile, otp);
+      const verified = await ctx.customerRepo.verifyOtp(cleanMobile, otp);
       if (!verified) {
         HttpServer.json(res, 400, { error: 'Invalid or expired verification code. Please request a new OTP.' });
         return;
@@ -320,7 +320,7 @@ export function registerCustomerRoutes(server, ctx) {
       const resolvedEmail = normalizeEmail(body.email || pending.email) || `${cleanMobile}@customer.youpi.local`;
 
       try {
-        customer = ctx.customerRepo.create({
+        customer = await ctx.customerRepo.create({
           name: resolvedName,
           email: resolvedEmail,
           mobileNumber: cleanMobile,
@@ -347,7 +347,7 @@ export function registerCustomerRoutes(server, ctx) {
     // Issue server-authoritative session
     const ipAddress = req.socket?.remoteAddress || null;
     const userAgent = req.headers['user-agent'] || null;
-    const session = ctx.customerSessionRepo.create({
+    const session = await ctx.customerSessionRepo.create({
       customerId: customer.id,
       ipAddress,
       userAgent
@@ -356,7 +356,7 @@ export function registerCustomerRoutes(server, ctx) {
     res.setHeader('Set-Cookie', buildSessionCookie(session.token));
 
     if (ctx.auditRepo) {
-      ctx.auditRepo.log({
+      await ctx.auditRepo.log({
         entityType: 'CUSTOMER',
         entityId: customer.id,
         action: 'CUSTOMER_WHATSAPP_OTP_LOGGED_IN',
@@ -416,14 +416,14 @@ export function registerCustomerRoutes(server, ctx) {
     }
 
     // Check unique email
-    const existingByEmail = ctx.customerRepo.findByEmail(resolvedEmail);
+    const existingByEmail = await ctx.customerRepo.findByEmail(resolvedEmail);
     if (existingByEmail) {
       HttpServer.json(res, 409, { error: 'An account with this email address already exists.' });
       return;
     }
 
     // Check unique mobile
-    const existingByMobile = ctx.customerRepo.findByMobile(resolvedMobile);
+    const existingByMobile = await ctx.customerRepo.findByMobile(resolvedMobile);
     if (existingByMobile) {
       HttpServer.json(res, 409, { error: 'An account with this mobile number already exists.' });
       return;
@@ -431,7 +431,7 @@ export function registerCustomerRoutes(server, ctx) {
 
     let customer;
     try {
-      customer = ctx.customerRepo.create({
+      customer = await ctx.customerRepo.create({
         name: resolvedName,
         email: resolvedEmail,
         mobileNumber: resolvedMobile,
@@ -445,7 +445,7 @@ export function registerCustomerRoutes(server, ctx) {
     // Create authenticated server-authoritative session
     const ipAddress = req.socket?.remoteAddress || null;
     const userAgent = req.headers['user-agent'] || null;
-    const session = ctx.customerSessionRepo.create({
+    const session = await ctx.customerSessionRepo.create({
       customerId: customer.id,
       ipAddress,
       userAgent
@@ -454,7 +454,7 @@ export function registerCustomerRoutes(server, ctx) {
     res.setHeader('Set-Cookie', buildSessionCookie(session.token));
 
     if (ctx.auditRepo) {
-      ctx.auditRepo.log({
+      await ctx.auditRepo.log({
         entityType: 'CUSTOMER',
         entityId: customer.id,
         action: 'CUSTOMER_REGISTERED',
@@ -493,7 +493,7 @@ export function registerCustomerRoutes(server, ctx) {
       return;
     }
 
-    const verified = ctx.customerRepo.verifyCredentials(identifier, password);
+    const verified = await ctx.customerRepo.verifyCredentials(identifier, password);
     if (!verified) {
       HttpServer.json(res, 401, { error: 'Invalid credentials. Please check your email/mobile and password.' });
       return;
@@ -512,7 +512,7 @@ export function registerCustomerRoutes(server, ctx) {
     // Create session
     const ipAddress = req.socket?.remoteAddress || null;
     const userAgent = req.headers['user-agent'] || null;
-    const session = ctx.customerSessionRepo.create({
+    const session = await ctx.customerSessionRepo.create({
       customerId: verified.id,
       ipAddress,
       userAgent
@@ -521,7 +521,7 @@ export function registerCustomerRoutes(server, ctx) {
     res.setHeader('Set-Cookie', buildSessionCookie(session.token));
 
     if (ctx.auditRepo) {
-      ctx.auditRepo.log({
+      await ctx.auditRepo.log({
         entityType: 'CUSTOMER',
         entityId: verified.id,
         action: 'CUSTOMER_LOGGED_IN',
@@ -556,7 +556,7 @@ export function registerCustomerRoutes(server, ctx) {
       return;
     }
 
-    const authContext = ctx.customerSessionRepo.findByToken(token);
+    const authContext = await ctx.customerSessionRepo.findByToken(token);
     if (!authContext) {
       HttpServer.json(res, 401, { error: 'Session expired or invalid.' });
       return;
@@ -586,7 +586,7 @@ export function registerCustomerRoutes(server, ctx) {
     const token = extractSessionToken(req) || body.token;
 
     if (token) {
-      ctx.customerSessionRepo.revokeToken(token);
+      await ctx.customerSessionRepo.revokeToken(token);
     }
 
     res.setHeader('Set-Cookie', 'youpi_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax');
@@ -603,7 +603,7 @@ export function registerCustomerRoutes(server, ctx) {
       return;
     }
 
-    const authContext = ctx.customerSessionRepo.findByToken(targetToken);
+    const authContext = await ctx.customerSessionRepo.findByToken(targetToken);
     if (!authContext) {
       HttpServer.json(res, 401, { error: 'Target account session has expired. Please log in again.' });
       return;

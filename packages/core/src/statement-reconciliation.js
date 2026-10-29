@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { PaymentStatus } from '@youpi/common';
+import { mapMaybe, runMaybe } from '@youpi/db';
 import { parseStatementCsv } from './statement-parser.js';
 
 /** Statement value date may post on the observation day or the next two calendar days. */
@@ -48,36 +49,40 @@ export class StatementReconciliation {
   }
 
   importCsv({ receivingAccountId, csvText }) {
-    const parsed = parseStatementCsv(csvText);
-    if (parsed.error) return { error: parsed.error, lines: [] };
-    const lines = parsed.lines.map(line => this.applyLine(receivingAccountId, line));
-    return {
-      lines,
-      reconciled: lines.filter(line => line.outcome === 'RECONCILED').length,
-      conflicts: lines.filter(line => line.outcome === 'CONFLICT').length,
-      unmatched: lines.filter(line => line.outcome === 'UNMATCHED').length
-    };
+    return runMaybe(function* () {
+      const parsed = parseStatementCsv(csvText);
+      if (parsed.error) return { error: parsed.error, lines: [] };
+      const lines = [];
+      for (const line of parsed.lines) lines.push(yield this.applyLine(receivingAccountId, line));
+      return {
+        lines,
+        reconciled: lines.filter(line => line.outcome === 'RECONCILED').length,
+        conflicts: lines.filter(line => line.outcome === 'CONFLICT').length,
+        unmatched: lines.filter(line => line.outcome === 'UNMATCHED').length
+      };
+    }.bind(this));
   }
 
   applyLine(receivingAccountId, line) {
-    const hash = sourceHash(receivingAccountId, line);
-    const existing = this.db.queryOne(
-      'SELECT * FROM bank_statement_lines WHERE receiving_account_id = ? AND source_hash = ?',
-      [receivingAccountId, hash]
-    );
-    if (existing && existing.match_status === 'RECONCILED') {
-      return {
-        outcome: 'DUPLICATE',
-        matchStatus: 'RECONCILED',
-        paymentSessionId: existing.payment_session_id,
-        statementLineId: existing.id,
-        utr: existing.utr
-      };
-    }
+    return runMaybe(function* () {
+      const hash = sourceHash(receivingAccountId, line);
+      const existing = yield this.db.queryOne(
+        'SELECT * FROM bank_statement_lines WHERE receiving_account_id = ? AND source_hash = ?',
+        [receivingAccountId, hash]
+      );
+      if (existing && existing.match_status === 'RECONCILED') {
+        return {
+          outcome: 'DUPLICATE',
+          matchStatus: 'RECONCILED',
+          paymentSessionId: existing.payment_session_id,
+          statementLineId: existing.id,
+          utr: existing.utr
+        };
+      }
 
-    const rowId = existing?.id || crypto.randomUUID();
-    if (!existing) {
-      this.db.execute(`
+      const rowId = existing?.id || crypto.randomUUID();
+      if (!existing) {
+        yield this.db.execute(`
         INSERT INTO bank_statement_lines (
           id, receiving_account_id, source_hash, booked_on, amount_paise, currency,
           direction, utr, narration, match_status, match_reason, payment_session_id, imported_at
@@ -93,53 +98,48 @@ export class StatementReconciliation {
         line.narration,
         new Date().toISOString()
       ]);
-    }
-
-    if (line.direction !== 'CREDIT') {
-      return this.finish(rowId, 'IGNORED', 'DEBIT', null);
-    }
-    if (!line.utr) {
-      const reason = line.referenceCount > 1 ? 'AMBIGUOUS_REFERENCE' : 'MISSING_REFERENCE';
-      return this.finish(rowId, 'CONFLICT', reason, null);
-    }
-
-    const already = this.findReconciled(receivingAccountId, line);
-    if (already) {
-      return this.finish(rowId, 'RECONCILED', 'ALREADY_RECONCILED', already.id, { emit: false });
-    }
-
-    const attributed = this.findAttributed(receivingAccountId, line.utr)
-      .filter(session => session.currency === 'INR' || !session.currency);
-    const exact = attributed.filter(session => sameAmount(session, line.amountPaise));
-    const amountConflicts = attributed.filter(session => !sameAmount(session, line.amountPaise));
-
-    if (exact.length > 1 || amountConflicts.length > 0) {
-      this.holdAll([...exact, ...amountConflicts], 'STATEMENT_AMOUNT_OR_DUPLICATE');
-      return this.finish(rowId, 'CONFLICT', exact.length > 1 ? 'MULTIPLE_SESSIONS' : 'AMOUNT_MISMATCH', null);
-    }
-    if (exact.length === 1) {
-      const session = exact[0];
-      const observedOn = this.observedCalendarDate(session);
-      if (!observedOn || !this.withinPostingWindow(observedOn, line.bookedOn)) {
-        this.holdAll([session], 'STATEMENT_DATE_OUTSIDE_WINDOW');
-        return this.finish(rowId, 'CONFLICT', 'STATEMENT_DATE_OUTSIDE_WINDOW', null);
       }
-      return this.reconcile(rowId, session);
-    }
 
-    const held = this.findManualReviewByAmount(receivingAccountId, line.amountPaise);
-    const seen = this.observationsForReference(receivingAccountId, line);
-    if (held.length === 1 && seen.length >= 1) {
-      const observedOn = calendarDateInIndia(seen[0].observed_at);
-      if (!observedOn || !this.withinPostingWindow(observedOn, line.bookedOn)) {
-        return this.finish(rowId, 'CONFLICT', 'STATEMENT_DATE_OUTSIDE_WINDOW', null);
+      if (line.direction !== 'CREDIT') return yield this.finish(rowId, 'IGNORED', 'DEBIT', null);
+      if (!line.utr) {
+        const reason = line.referenceCount > 1 ? 'AMBIGUOUS_REFERENCE' : 'MISSING_REFERENCE';
+        return yield this.finish(rowId, 'CONFLICT', reason, null);
       }
-      return this.reconcile(rowId, held[0]);
-    }
-    if (held.length > 1 && seen.length >= 1) {
-      return this.finish(rowId, 'CONFLICT', 'MULTIPLE_SESSIONS', null);
-    }
-    return this.finish(rowId, 'UNMATCHED', 'NO_OBSERVED_SESSION', null);
+
+      const already = yield this.findReconciled(receivingAccountId, line);
+      if (already) return yield this.finish(rowId, 'RECONCILED', 'ALREADY_RECONCILED', already.id, { emit: false });
+
+      const attributed = (yield this.findAttributed(receivingAccountId, line.utr))
+        .filter(session => session.currency === 'INR' || !session.currency);
+      const exact = attributed.filter(session => sameAmount(session, line.amountPaise));
+      const amountConflicts = attributed.filter(session => !sameAmount(session, line.amountPaise));
+
+      if (exact.length > 1 || amountConflicts.length > 0) {
+        yield this.holdAll([...exact, ...amountConflicts], 'STATEMENT_AMOUNT_OR_DUPLICATE');
+        return yield this.finish(rowId, 'CONFLICT', exact.length > 1 ? 'MULTIPLE_SESSIONS' : 'AMOUNT_MISMATCH', null);
+      }
+      if (exact.length === 1) {
+        const session = exact[0];
+        const observedOn = yield this.observedCalendarDate(session);
+        if (!observedOn || !this.withinPostingWindow(observedOn, line.bookedOn)) {
+          yield this.holdAll([session], 'STATEMENT_DATE_OUTSIDE_WINDOW');
+          return yield this.finish(rowId, 'CONFLICT', 'STATEMENT_DATE_OUTSIDE_WINDOW', null);
+        }
+        return yield this.reconcile(rowId, session);
+      }
+
+      const held = yield this.findManualReviewByAmount(receivingAccountId, line.amountPaise);
+      const seen = yield this.observationsForReference(receivingAccountId, line);
+      if (held.length === 1 && seen.length >= 1) {
+        const observedOn = calendarDateInIndia(seen[0].observed_at);
+        if (!observedOn || !this.withinPostingWindow(observedOn, line.bookedOn)) {
+          return yield this.finish(rowId, 'CONFLICT', 'STATEMENT_DATE_OUTSIDE_WINDOW', null);
+        }
+        return yield this.reconcile(rowId, held[0]);
+      }
+      if (held.length > 1 && seen.length >= 1) return yield this.finish(rowId, 'CONFLICT', 'MULTIPLE_SESSIONS', null);
+      return yield this.finish(rowId, 'UNMATCHED', 'NO_OBSERVED_SESSION', null);
+    }.bind(this));
   }
 
   withinPostingWindow(observedOn, bookedOn) {
@@ -147,15 +147,14 @@ export class StatementReconciliation {
   }
 
   observedCalendarDate(session) {
-    const row = this.db.queryOne(
+    return mapMaybe(this.db.queryOne(
       'SELECT observed_at FROM payment_observations WHERE id = ? OR attributed_payment_id = ? ORDER BY observed_at ASC LIMIT 1',
       [session.attributedObservationId || '', session.id]
-    );
-    return calendarDateInIndia(row?.observed_at || session.completedAt || session.createdAt);
+    ), row => calendarDateInIndia(row?.observed_at || session.completedAt || session.createdAt));
   }
 
   findAttributed(receivingAccountId, utr) {
-    const rows = this.db.query(`
+    return mapMaybe(this.db.query(`
       SELECT DISTINCT ps.*
       FROM payment_sessions ps
       JOIN payment_observations po
@@ -163,12 +162,11 @@ export class StatementReconciliation {
       WHERE ps.receiving_account_id = ?
         AND ps.status IN ('OBSERVED_SUCCESS', 'MANUAL_REVIEW')
         AND po.bank_reference_number = ?
-    `, [receivingAccountId, utr]);
-    return rows.map(row => this.sessionRepo.mapRow(row));
+    `, [receivingAccountId, utr]), rows => rows.map(row => this.sessionRepo.mapRow(row)));
   }
 
   findReconciled(receivingAccountId, line) {
-    const row = this.db.queryOne(`
+    return mapMaybe(this.db.queryOne(`
       SELECT ps.*
       FROM payment_sessions ps
       JOIN payment_observations po
@@ -178,16 +176,14 @@ export class StatementReconciliation {
         AND ps.amount_paise = ?
         AND po.bank_reference_number = ?
       LIMIT 1
-    `, [receivingAccountId, line.amountPaise, line.utr]);
-    return row ? this.sessionRepo.mapRow(row) : null;
+    `, [receivingAccountId, line.amountPaise, line.utr]), row => row ? this.sessionRepo.mapRow(row) : null);
   }
 
   findManualReviewByAmount(receivingAccountId, amountPaise) {
-    const rows = this.db.query(`
+    return mapMaybe(this.db.query(`
       SELECT * FROM payment_sessions
       WHERE receiving_account_id = ? AND status = 'MANUAL_REVIEW' AND amount_paise = ?
-    `, [receivingAccountId, amountPaise]);
-    return rows.map(row => this.sessionRepo.mapRow(row));
+    `, [receivingAccountId, amountPaise]), rows => rows.map(row => this.sessionRepo.mapRow(row)));
   }
 
   observationsForReference(receivingAccountId, line) {
@@ -198,43 +194,51 @@ export class StatementReconciliation {
   }
 
   holdAll(sessions, reason) {
-    for (const session of sessions) {
-      if (session.status !== PaymentStatus.OBSERVED_SUCCESS && session.status !== PaymentStatus.MANUAL_REVIEW) continue;
-      const before = session.status;
-      try {
-        const updated = this.sessionRepo.transitionToTerminal(session.id, PaymentStatus.MANUAL_REVIEW);
-        if (before !== PaymentStatus.MANUAL_REVIEW && updated.status === PaymentStatus.MANUAL_REVIEW) {
-          this.eventEmitter?.emit('PAYMENT.MANUAL_REVIEW', {
-            paymentId: session.id,
-            orderId: session.orderId,
-            merchantId: session.merchantId,
-            reason
-          });
+    const repository = this;
+    return runMaybe(function* () {
+      for (const session of sessions) {
+        if (session.status !== PaymentStatus.OBSERVED_SUCCESS && session.status !== PaymentStatus.MANUAL_REVIEW) continue;
+        const before = session.status;
+        try {
+          const updated = yield repository.sessionRepo.transitionToTerminal(session.id, PaymentStatus.MANUAL_REVIEW);
+          if (before !== PaymentStatus.MANUAL_REVIEW && updated.status === PaymentStatus.MANUAL_REVIEW) {
+            repository.eventEmitter?.emit('PAYMENT.MANUAL_REVIEW', {
+              paymentId: session.id,
+              orderId: session.orderId,
+              merchantId: session.merchantId,
+              reason
+            });
+          }
+        } catch {
+          // An illegal edge leaves the session unreconciled. The statement row records the conflict.
         }
-      } catch {
-        // An illegal edge leaves the session unreconciled. The statement row records the conflict.
       }
-    }
+    });
   }
 
   reconcile(rowId, session) {
-    const before = session.status;
-    const updated = this.sessionRepo.transitionToTerminal(session.id, PaymentStatus.RECONCILED);
-    if (updated.status !== PaymentStatus.RECONCILED) {
-      return this.finish(rowId, 'CONFLICT', 'TRANSITION_REJECTED', null);
-    }
-    const emit = before !== PaymentStatus.RECONCILED;
-    return this.finish(rowId, 'RECONCILED', 'BANK_STATEMENT_MATCH', updated.id, { emit, session: updated });
+    const repository = this;
+    return runMaybe(function* () {
+      const before = session.status;
+      const updated = yield repository.sessionRepo.transitionToTerminal(session.id, PaymentStatus.RECONCILED);
+      if (updated.status !== PaymentStatus.RECONCILED) {
+        return yield repository.finish(rowId, 'CONFLICT', 'TRANSITION_REJECTED', null);
+      }
+      const emit = before !== PaymentStatus.RECONCILED;
+      return yield repository.finish(rowId, 'RECONCILED', 'BANK_STATEMENT_MATCH', updated.id, { emit, session: updated });
+    });
   }
 
   finish(rowId, matchStatus, matchReason, paymentSessionId, options = {}) {
-    this.db.execute(`
+    const repository = this;
+    return runMaybe(function* () {
+    yield repository.db.execute(`
       UPDATE bank_statement_lines
       SET match_status = ?, match_reason = ?, payment_session_id = ?
       WHERE id = ?
     `, [matchStatus, matchReason, paymentSessionId, rowId]);
     if (options.emit && options.session) {
-      this.auditRepo?.log({
+      yield repository.auditRepo?.log({
         merchantId: options.session.merchantId,
         entityType: 'PAYMENT_SESSION',
         entityId: options.session.id,
@@ -242,7 +246,7 @@ export class StatementReconciliation {
         actorType: 'ADMIN',
         details: { statementLineId: rowId, amountPaise: options.session.amountPaise.toString() }
       });
-      this.eventEmitter?.emit('PAYMENT.RECONCILED', {
+      repository.eventEmitter?.emit('PAYMENT.RECONCILED', {
         paymentId: options.session.id,
         orderId: options.session.orderId,
         merchantId: options.session.merchantId,
@@ -259,5 +263,6 @@ export class StatementReconciliation {
       paymentSessionId,
       statementLineId: rowId
     };
+    });
   }
 }

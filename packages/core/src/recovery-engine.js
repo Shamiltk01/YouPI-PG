@@ -1,4 +1,5 @@
 import { PaymentStatus } from '@youpi/common';
+import { runMaybe } from '@youpi/db';
 
 export class RecoveryEngine {
   /**
@@ -35,6 +36,7 @@ export class RecoveryEngine {
    * }}
    */
   recover() {
+    return runMaybe(function* () {
     let expiredCount = 0;
     let failedCount = 0;
     let rescheduledCount = 0;
@@ -44,16 +46,16 @@ export class RecoveryEngine {
     const nowIso = now.toISOString();
 
     // 1. Recover overdue PROCESSING sessions -> mark SUCCESS if verified/attributed, else FAILED
-    const overdueProcessing = this.db.query(`
+    const overdueProcessing = yield this.db.query(`
       SELECT id, merchant_id, order_id, receiving_account_id, verification_level, attributed_observation_id FROM payment_sessions
       WHERE status = ? AND processing_expires_at < ?
     `, [PaymentStatus.PROCESSING, nowIso]);
 
     for (const row of overdueProcessing) {
       if (row.verification_level >= 1 || row.attributed_observation_id) {
-        this.sessionRepo.transitionToTerminal(row.id, PaymentStatus.OBSERVED_SUCCESS);
+        yield this.sessionRepo.transitionToTerminal(row.id, PaymentStatus.OBSERVED_SUCCESS);
         if (this.auditRepo) {
-          this.auditRepo.log({
+          yield this.auditRepo.log({
             entityType: 'PAYMENT_SESSION',
             entityId: row.id,
             action: 'CRASH_RECOVERY_ATTRIBUTED_OBSERVED',
@@ -68,10 +70,10 @@ export class RecoveryEngine {
           });
         }
       } else {
-        this.sessionRepo.transitionToTerminal(row.id, PaymentStatus.FAILED);
+        yield this.sessionRepo.transitionToTerminal(row.id, PaymentStatus.FAILED);
         failedCount++;
         if (this.auditRepo) {
-          this.auditRepo.log({
+          yield this.auditRepo.log({
             entityType: 'PAYMENT_SESSION',
             entityId: row.id,
             action: 'CRASH_RECOVERY_EXPIRED_PROCESSING',
@@ -89,16 +91,16 @@ export class RecoveryEngine {
     }
 
     // 2. Recover overdue ACTIVE sessions -> mark EXPIRED
-    const overdueActive = this.db.query(`
+    const overdueActive = yield this.db.query(`
       SELECT id, merchant_id, order_id, receiving_account_id FROM payment_sessions
       WHERE status = ? AND expires_at < ?
     `, [PaymentStatus.ACTIVE, nowIso]);
 
     for (const row of overdueActive) {
-      this.sessionRepo.transitionToTerminal(row.id, PaymentStatus.EXPIRED);
+      yield this.sessionRepo.transitionToTerminal(row.id, PaymentStatus.EXPIRED);
       expiredCount++;
       if (this.auditRepo) {
-        this.auditRepo.log({
+        yield this.auditRepo.log({
           entityType: 'PAYMENT_SESSION',
           entityId: row.id,
           action: 'CRASH_RECOVERY_EXPIRED_ACTIVE',
@@ -115,18 +117,18 @@ export class RecoveryEngine {
     }
 
     // 3. Reschedule ongoing ACTIVE sessions
-    const ongoingActive = this.db.query(`
+    const ongoingActive = yield this.db.query(`
       SELECT id, expires_at FROM payment_sessions
       WHERE status = ? AND expires_at >= ?
     `, [PaymentStatus.ACTIVE, nowIso]);
 
     for (const row of ongoingActive) {
-      this.timingEngine.startActiveTimer(row.id, new Date(row.expires_at));
+      yield this.timingEngine.startActiveTimer(row.id, new Date(row.expires_at));
       rescheduledCount++;
     }
 
     // 4. Reschedule ongoing PROCESSING sessions
-    const ongoingProcessing = this.db.query(`
+    const ongoingProcessing = yield this.db.query(`
       SELECT id, processing_expires_at FROM payment_sessions
       WHERE status = ? AND processing_expires_at >= ?
     `, [PaymentStatus.PROCESSING, nowIso]);
@@ -134,7 +136,9 @@ export class RecoveryEngine {
     for (const row of ongoingProcessing) {
       const remainingMs = Math.max(0, new Date(row.processing_expires_at).getTime() - Date.now());
       const procTimer = setTimeout(() => {
-        this.timingEngine.handleProcessingTimerExpiration(row.id);
+        Promise.resolve(this.timingEngine.handleProcessingTimerExpiration(row.id)).catch(err => {
+          console.error('[RecoveryEngine] Processing timer recovery failed:', err.message);
+        });
       }, remainingMs);
       if (procTimer.unref) procTimer.unref();
       this.timingEngine.processingTimers.set(row.id, procTimer);
@@ -142,12 +146,12 @@ export class RecoveryEngine {
     }
 
     // 5. Scan all receiving accounts: promote waiting queue if slot is now vacant
-    const accounts = this.db.query(`SELECT id FROM payment_receiving_accounts WHERE is_active = 1`);
+    const accounts = yield this.db.query(`SELECT id FROM payment_receiving_accounts WHERE is_active = 1`);
     for (const acc of accounts) {
-      const promoted = this.queueEngine.promoteNext(acc.id);
+      const promoted = yield this.queueEngine.promoteNext(acc.id);
       if (promoted) {
         promotedCount++;
-        this.timingEngine.startActiveTimer(promoted.id, promoted.expiresAt);
+        yield this.timingEngine.startActiveTimer(promoted.id, promoted.expiresAt);
       }
     }
 
@@ -155,7 +159,7 @@ export class RecoveryEngine {
     let recoveredWebhooksCount = 0;
     if (this.webhookEngine && typeof this.webhookEngine.recoverMissingDeliveries === 'function') {
       try {
-        recoveredWebhooksCount = this.webhookEngine.recoverMissingDeliveries({ resetInFlight: true });
+        recoveredWebhooksCount = yield this.webhookEngine.recoverMissingDeliveries({ resetInFlight: true });
       } catch {}
     }
 
@@ -166,5 +170,6 @@ export class RecoveryEngine {
       promotedCount,
       recoveredWebhooksCount
     };
+    }.bind(this));
   }
 }

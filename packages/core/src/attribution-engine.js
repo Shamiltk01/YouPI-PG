@@ -1,4 +1,5 @@
 import { PaymentStatus, ObservationAttributionStatus, TicketStatus, SenderType, isTerminalStatus } from '@youpi/common';
+import { runMaybe } from '@youpi/db';
 
 export class AttributionEngine {
   /**
@@ -42,61 +43,63 @@ export class AttributionEngine {
    * Live sessions move to MANUAL_REVIEW. The observation is kept as evidence.
    */
   holdAmbiguous(savedObs, sessions, reason) {
-    this.obsRepo.markAmbiguous(savedObs.id);
-    const ids = [];
-    for (const session of sessions) {
-      if (!session?.id) continue;
-      ids.push(session.id);
-      const live = session.status === PaymentStatus.ACTIVE
-        || session.status === PaymentStatus.PROCESSING
-        || session.status === PaymentStatus.OBSERVED_SUCCESS;
-      if (!live) continue;
-      try {
-        this.sessionRepo.transitionToTerminal(session.id, PaymentStatus.MANUAL_REVIEW, { reason });
-        this.eventEmitter.emit('PAYMENT.MANUAL_REVIEW', {
-          paymentId: session.id,
-          orderId: session.orderId || session.order_id,
-          merchantId: session.merchantId || session.merchant_id,
-          observationId: savedObs.id,
-          reason
-        });
-      } catch (err) {
-        if (this.auditRepo) {
-          this.auditRepo.log({
+    return runMaybe(function* () {
+      yield this.obsRepo.markAmbiguous(savedObs.id);
+      const ids = [];
+      for (const session of sessions) {
+        if (!session?.id) continue;
+        ids.push(session.id);
+        const live = session.status === PaymentStatus.ACTIVE
+          || session.status === PaymentStatus.PROCESSING
+          || session.status === PaymentStatus.OBSERVED_SUCCESS;
+        if (!live) continue;
+        try {
+          yield this.sessionRepo.transitionToTerminal(session.id, PaymentStatus.MANUAL_REVIEW, { reason });
+          this.eventEmitter.emit('PAYMENT.MANUAL_REVIEW', {
+            paymentId: session.id,
+            orderId: session.orderId || session.order_id,
             merchantId: session.merchantId || session.merchant_id,
-            entityType: 'PAYMENT_SESSION',
-            entityId: session.id,
-            action: 'AMBIGUOUS_MATCH_TRANSITION_FAILED',
-            actorType: 'SYSTEM',
-            details: { reason, error: err.message, observationId: savedObs.id }
+            observationId: savedObs.id,
+            reason
           });
+        } catch (err) {
+          if (this.auditRepo) {
+            yield this.auditRepo.log({
+              merchantId: session.merchantId || session.merchant_id,
+              entityType: 'PAYMENT_SESSION',
+              entityId: session.id,
+              action: 'AMBIGUOUS_MATCH_TRANSITION_FAILED',
+              actorType: 'SYSTEM',
+              details: { reason, error: err.message, observationId: savedObs.id }
+            });
+          }
         }
       }
-    }
-    if (this.auditRepo && sessions[0]) {
-      this.auditRepo.log({
-        merchantId: sessions[0].merchantId || sessions[0].merchant_id,
-        entityType: 'PAYMENT_OBSERVATION',
-        entityId: savedObs.id,
-        action: 'AMBIGUOUS_MATCH_MANUAL_REVIEW',
-        actorType: 'SYSTEM',
-        details: {
-          reason,
-          observationId: savedObs.id,
-          sessionIds: ids,
-          amountPaise: savedObs.amountPaise?.toString?.() || String(savedObs.amount_paise || '')
-        }
-      });
-    }
-    return {
-      attributed: false,
-      duplicate: false,
-      lateMatch: false,
-      ambiguous: true,
-      observationId: savedObs.id,
-      outcomeStatus: PaymentStatus.MANUAL_REVIEW,
-      reason
-    };
+      if (this.auditRepo && sessions[0]) {
+        yield this.auditRepo.log({
+          merchantId: sessions[0].merchantId || sessions[0].merchant_id,
+          entityType: 'PAYMENT_OBSERVATION',
+          entityId: savedObs.id,
+          action: 'AMBIGUOUS_MATCH_MANUAL_REVIEW',
+          actorType: 'SYSTEM',
+          details: {
+            reason,
+            observationId: savedObs.id,
+            sessionIds: ids,
+            amountPaise: savedObs.amountPaise?.toString?.() || String(savedObs.amount_paise || '')
+          }
+        });
+      }
+      return {
+        attributed: false,
+        duplicate: false,
+        lateMatch: false,
+        ambiguous: true,
+        observationId: savedObs.id,
+        outcomeStatus: PaymentStatus.MANUAL_REVIEW,
+        reason
+      };
+    }.bind(this));
   }
 
   /**
@@ -119,13 +122,14 @@ export class AttributionEngine {
       normalizedObs = { ...normalizedObs, amountPaise: BigInt(normalizedObs.amountPaise) };
     }
 
+    return runMaybe(function* () {
     // Tier 1: Check fingerprint for deduplication
-    const existing = this.obsRepo.findByFingerprint(normalizedObs.fingerprintHash);
+    const existing = yield this.obsRepo.findByFingerprint(normalizedObs.fingerprintHash);
     if (existing) {
       // If observation came from the SAME source, drop as redundant duplicate
       if (existing.source === normalizedObs.source) {
         if (this.auditRepo) {
-          this.auditRepo.log({
+          yield this.auditRepo.log({
             entityType: 'PAYMENT_OBSERVATION',
             entityId: existing.id,
             action: 'DUPLICATE_OBSERVATION_DROPPED',
@@ -146,17 +150,17 @@ export class AttributionEngine {
       // If observation came from a NEW, DIFFERENT channel and payment was already attributed:
       // Upgrade verification tier to Level 2 (Dual Verification)!
       if (existing.attributedPaymentId) {
-        const targetSession = this.sessionRepo.findById(existing.attributedPaymentId);
+        const targetSession = yield this.sessionRepo.findById(existing.attributedPaymentId);
         const closedWithoutUpgrade = targetSession
           && isTerminalStatus(targetSession.status)
           && targetSession.status !== PaymentStatus.SUCCESS
           && targetSession.status !== PaymentStatus.OBSERVED_SUCCESS
           && targetSession.status !== PaymentStatus.RECONCILED;
         if (closedWithoutUpgrade) {
-          const savedObs = this.obsRepo.create(normalizedObs);
-          this.obsRepo.markLateUnmatched(savedObs.id);
+          const savedObs = yield this.obsRepo.create(normalizedObs);
+          yield this.obsRepo.markLateUnmatched(savedObs.id);
           if (this.auditRepo) {
-            this.auditRepo.log({
+            yield this.auditRepo.log({
               merchantId: targetSession.merchantId,
               entityType: 'PAYMENT_SESSION',
               entityId: targetSession.id,
@@ -170,7 +174,7 @@ export class AttributionEngine {
             });
           }
           if (this.ticketRepo && targetSession.customerId) {
-            this.ticketRepo.createTicket({
+            yield this.ticketRepo.createTicket({
               merchantId: targetSession.merchantId,
               customerId: targetSession.customerId,
               paymentId: targetSession.id,
@@ -207,10 +211,10 @@ export class AttributionEngine {
           this.pendingGraceTimers.delete(existing.attributedPaymentId);
         }
 
-        const savedObs = this.obsRepo.create(normalizedObs);
+        const savedObs = yield this.obsRepo.create(normalizedObs);
         let verifyResult;
         try {
-          verifyResult = this.sessionRepo.recordVerificationSource(
+          verifyResult = yield this.sessionRepo.recordVerificationSource(
             existing.attributedPaymentId,
             normalizedObs.source,
             savedObs.id,
@@ -223,7 +227,7 @@ export class AttributionEngine {
               WHERE id = ?
             `, [ObservationAttributionStatus.ATTRIBUTED, savedObs.id]);
           } else {
-            this.obsRepo.markAttributed(savedObs.id, existing.attributedPaymentId);
+            yield this.obsRepo.markAttributed(savedObs.id, existing.attributedPaymentId);
           }
         } catch (dbErr) {
           const errMsg = dbErr?.message || '';
@@ -240,7 +244,7 @@ export class AttributionEngine {
         }
 
         if (this.auditRepo) {
-          this.auditRepo.log({
+          yield this.auditRepo.log({
             entityType: 'PAYMENT_SESSION',
             entityId: existing.attributedPaymentId,
             action: 'PAYMENT_VERIFICATION_UPGRADED',
@@ -289,23 +293,23 @@ export class AttributionEngine {
     }
 
     // Persist new observation as UNATTRIBUTED first
-    const savedObs = this.obsRepo.create(normalizedObs);
+    const savedObs = yield this.obsRepo.create(normalizedObs);
 
     // Tier 2: Check currently active session on receiving account
     let currentSession = null;
     if (normalizedObs.rawPayload?.targetSessionId) {
-      currentSession = this.sessionRepo.findById(normalizedObs.rawPayload.targetSessionId);
+      currentSession = yield this.sessionRepo.findById(normalizedObs.rawPayload.targetSessionId);
     }
     if (!currentSession || (currentSession.amountPaise !== normalizedObs.amountPaise)) {
-      currentSession = this.sessionRepo.findCurrentActiveOrProcessing(normalizedObs.receivingAccountId);
+      currentSession = yield this.sessionRepo.findCurrentActiveOrProcessing(normalizedObs.receivingAccountId);
     }
     if (currentSession && currentSession.amountPaise !== normalizedObs.amountPaise) {
-      const matchRows = this.sessionRepo.db.query(`
+      const matchRows = yield this.sessionRepo.db.query(`
         SELECT * FROM payment_sessions
         WHERE receiving_account_id = ? AND status IN ('ACTIVE', 'PROCESSING') AND amount_paise = ?
       `, [normalizedObs.receivingAccountId, Number(normalizedObs.amountPaise)]);
       if (matchRows.length > 1) {
-        return this.holdAmbiguous(
+        return yield this.holdAmbiguous(
           savedObs,
           matchRows.map(row => this.sessionRepo.mapRow(row)),
           'MULTIPLE_LIVE_AMOUNT_MATCHES'
@@ -319,14 +323,14 @@ export class AttributionEngine {
       // Fallback: match the amount, but only inside the receiving account the observer
       // reported. Matching "any ACTIVE session on the gateway with this amount" could settle a
       // different merchant's live payment (cross-merchant hijack), so it is intentionally gone.
-      const candidates = this.sessionRepo.db.query(`
+      const candidates = yield this.sessionRepo.db.query(`
         SELECT * FROM payment_sessions
         WHERE receiving_account_id = ?
           AND status IN ('ACTIVE', 'PROCESSING')
           AND amount_paise = ?
       `, [normalizedObs.receivingAccountId, Number(normalizedObs.amountPaise)]);
       if (candidates.length > 1) {
-        return this.holdAmbiguous(
+        return yield this.holdAmbiguous(
           savedObs,
           candidates.map(row => this.sessionRepo.mapRow(row)),
           'MULTIPLE_LIVE_AMOUNT_MATCHES'
@@ -348,7 +352,7 @@ export class AttributionEngine {
       let isPriorExpiredSession = false;
       if (currentSession.slotAcquiredAt && normalizedObs.observedAt < currentSession.slotAcquiredAt) {
         const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
-        const recentExpired = this.sessionRepo.findRecentlyExpiredOrFailed(
+        const recentExpired = yield this.sessionRepo.findRecentlyExpiredOrFailed(
           normalizedObs.receivingAccountId,
           thirtyMinutesAgo
         );
@@ -365,7 +369,7 @@ export class AttributionEngine {
       let isUtrAlreadyUsed = false;
       const trimmedUtr = normalizedObs.bankReferenceNumber ? String(normalizedObs.bankReferenceNumber).trim() : '';
       if (trimmedUtr.length > 0) {
-        const priorUsedSession = this.sessionRepo.db.queryOne(`
+        const priorUsedSession = yield this.sessionRepo.db.queryOne(`
           SELECT ps.id, ps.order_id
           FROM payment_sessions ps
           JOIN payment_observations po ON (ps.attributed_observation_id = po.id OR po.attributed_payment_id = ps.id)
@@ -378,7 +382,7 @@ export class AttributionEngine {
         if (priorUsedSession) {
           isUtrAlreadyUsed = true;
           if (this.auditRepo) {
-            this.auditRepo.log({
+            yield this.auditRepo.log({
               merchantId: currentSession.merchantId,
               entityType: 'PAYMENT_SESSION',
               entityId: currentSession.id,
@@ -440,7 +444,7 @@ export class AttributionEngine {
           // Second source confirmed within 5-second grace window -> LEVEL 2 DUAL VERIFICATION!
           let verifyResult;
           try {
-            verifyResult = this.sessionRepo.recordVerificationSource(
+            verifyResult = yield this.sessionRepo.recordVerificationSource(
               currentSession.id,
               normalizedObs.source,
               savedObs.id,
@@ -449,7 +453,7 @@ export class AttributionEngine {
 
             // Check if primary observation already holds the attributed bank_reference_number
             const primaryObs = currentSession.attributedObservationId
-              ? this.obsRepo.findById(currentSession.attributedObservationId)
+              ? yield this.obsRepo.findById(currentSession.attributedObservationId)
               : null;
             const sameUtrAsPrimary = Boolean(
               primaryObs &&
@@ -459,10 +463,10 @@ export class AttributionEngine {
             );
 
             if (!sameUtrAsPrimary) {
-              this.obsRepo.markAttributed(savedObs.id, currentSession.id);
+              yield this.obsRepo.markAttributed(savedObs.id, currentSession.id);
             } else {
               // Secondary dual-verification observation corroborates existing attributed UTR
-              this.obsRepo.db.execute(`
+              yield this.obsRepo.db.execute(`
                 UPDATE payment_observations
                 SET attribution_status = ?
                 WHERE id = ?
@@ -483,7 +487,7 @@ export class AttributionEngine {
           }
 
           if (this.auditRepo) {
-            this.auditRepo.log({
+            yield this.auditRepo.log({
               merchantId: currentSession.merchantId,
               entityType: 'PAYMENT_SESSION',
               entityId: currentSession.id,
@@ -536,19 +540,19 @@ export class AttributionEngine {
         // Record Level 1 verification source without immediate finalization (start 5-second grace window)
         let verifyResult;
         try {
-          verifyResult = this.sessionRepo.recordVerificationSource(
+          verifyResult = yield this.sessionRepo.recordVerificationSource(
             currentSession.id,
             normalizedObs.source,
             savedObs.id,
             { finalizeSuccess: false }
           );
 
-          this.obsRepo.markAttributed(savedObs.id, currentSession.id);
+          yield this.obsRepo.markAttributed(savedObs.id, currentSession.id);
         } catch (dbErr) {
           const errMsg = dbErr.message || '';
           if (errMsg.includes('UNIQUE constraint failed') || errMsg.includes('duplicate key value') || errMsg.includes('idx_observations_unique_attributed_bank_ref') || errMsg.includes('idx_payment_sessions_attributed_obs')) {
             if (this.auditRepo) {
-              this.auditRepo.log({
+              yield this.auditRepo.log({
                 merchantId: currentSession.merchantId,
                 entityType: 'PAYMENT_SESSION',
                 entityId: currentSession.id,
@@ -572,7 +576,7 @@ export class AttributionEngine {
         }
 
         if (this.auditRepo) {
-          this.auditRepo.log({
+          yield this.auditRepo.log({
             merchantId: currentSession.merchantId,
             entityType: 'PAYMENT_SESSION',
             entityId: currentSession.id,
@@ -602,7 +606,7 @@ export class AttributionEngine {
 
         // If grace period is 0 (e.g. in instant tests), finalize immediately unless dual channel is required
         if (this.verificationPolicy !== 'REQUIRE_DUAL_CHANNEL' && (this.verificationPolicy === 'SINGLE_CHANNEL_VALIDATED_GMAIL' || this.gracePeriodMs <= 0)) {
-          const finalResult = this.sessionRepo.recordVerificationSource(
+          const finalResult = yield this.sessionRepo.recordVerificationSource(
             currentSession.id,
             normalizedObs.source,
             savedObs.id,
@@ -658,8 +662,9 @@ export class AttributionEngine {
 
         const graceTimer = setTimeout(() => {
           this.pendingGraceTimers.delete(targetSessionId);
+          Promise.resolve(runMaybe(function* () {
           // Check if session became terminal during the grace window
-          const latestSession = this.sessionRepo.findById(targetSessionId);
+          const latestSession = yield this.sessionRepo.findById(targetSessionId);
           const alreadyObserved = latestSession && (
             latestSession.status === PaymentStatus.SUCCESS
             || latestSession.status === PaymentStatus.OBSERVED_SUCCESS
@@ -667,9 +672,9 @@ export class AttributionEngine {
           );
           if (!latestSession || (isTerminalStatus(latestSession.status) && !alreadyObserved)) {
             const sessionStatus = latestSession ? latestSession.status : 'EXPIRED';
-            this.obsRepo.markLateUnmatched(targetObsId);
+            yield this.obsRepo.markLateUnmatched(targetObsId);
             if (this.auditRepo) {
-              this.auditRepo.log({
+              yield this.auditRepo.log({
                 merchantId: targetMerchantId,
                 entityType: 'PAYMENT_SESSION',
                 entityId: targetSessionId,
@@ -683,7 +688,7 @@ export class AttributionEngine {
               });
             }
             if (this.ticketRepo && latestSession?.customerId) {
-              this.ticketRepo.createTicket({
+              yield this.ticketRepo.createTicket({
                 merchantId: targetMerchantId,
                 customerId: latestSession.customerId,
                 paymentId: targetSessionId,
@@ -711,7 +716,7 @@ export class AttributionEngine {
           }
 
           // 5 seconds elapsed without second source: finalize as Level 1
-          const finalResult = this.sessionRepo.recordVerificationSource(
+          const finalResult = yield this.sessionRepo.recordVerificationSource(
             targetSessionId,
             targetSource,
             targetObsId,
@@ -719,7 +724,7 @@ export class AttributionEngine {
           );
 
           if (this.auditRepo) {
-            this.auditRepo.log({
+            yield this.auditRepo.log({
               merchantId: targetMerchantId,
               entityType: 'PAYMENT_SESSION',
               entityId: targetSessionId,
@@ -744,6 +749,9 @@ export class AttributionEngine {
             verificationTag: finalResult.tag,
             sources: finalResult.sources
           });
+          }.bind(this))).catch(err => {
+            console.error('[AttributionEngine] Grace-period finalization failed:', err.message);
+          });
         }, this.gracePeriodMs);
 
         if (graceTimer.unref) graceTimer.unref();
@@ -767,7 +775,7 @@ export class AttributionEngine {
     // Check if observation confirms a recently successful session on this receiving account (within 60s)
     // Upgrades verification level (e.g. from Level 1 -> Level 2 -> Level 3)
     const sixtySecsAgo = new Date(Date.now() - 60000).toISOString();
-    const recentSuccessSession = this.sessionRepo.db.queryOne(`
+    const recentSuccessSession = yield this.sessionRepo.db.queryOne(`
       SELECT * FROM payment_sessions
       WHERE receiving_account_id = ? AND status IN ('SUCCESS', 'OBSERVED_SUCCESS')
         AND amount_paise = ? AND completed_at >= ?
@@ -777,7 +785,7 @@ export class AttributionEngine {
     if (recentSuccessSession) {
       // Check if this session's attributed observation had a UTR
       const existingObs = recentSuccessSession.attributed_observation_id
-        ? this.obsRepo.findById(recentSuccessSession.attributed_observation_id)
+        ? yield this.obsRepo.findById(recentSuccessSession.attributed_observation_id)
         : null;
 
       // If both have UTRs and they do NOT match, this is NOT the same transaction!
@@ -787,7 +795,7 @@ export class AttributionEngine {
 
       if (isUtrConflict) {
         if (this.auditRepo) {
-          this.auditRepo.log({
+          yield this.auditRepo.log({
             merchantId: recentSuccessSession.merchant_id,
             entityType: 'PAYMENT_SESSION',
             entityId: recentSuccessSession.id,
@@ -802,7 +810,7 @@ export class AttributionEngine {
           });
         }
         if (this.ticketRepo && recentSuccessSession.customer_id) {
-          this.ticketRepo.createTicket({
+          yield this.ticketRepo.createTicket({
             merchantId: recentSuccessSession.merchant_id,
             customerId: recentSuccessSession.customer_id,
             paymentId: recentSuccessSession.id,
@@ -835,16 +843,16 @@ export class AttributionEngine {
 
       // Temporal check: observation must have been observed during this session's window
       if (!isUtrConflict && normalizedObs.observedAt >= sessionSlotStart && normalizedObs.observedAt <= sessionCompleted) {
-        const verifyResult = this.sessionRepo.recordVerificationSource(
+        const verifyResult = yield this.sessionRepo.recordVerificationSource(
           recentSuccessSession.id,
           normalizedObs.source,
           savedObs.id
         );
 
-        this.obsRepo.markAttributed(savedObs.id, recentSuccessSession.id);
+        yield this.obsRepo.markAttributed(savedObs.id, recentSuccessSession.id);
 
         if (this.auditRepo) {
-          this.auditRepo.log({
+          yield this.auditRepo.log({
             merchantId: recentSuccessSession.merchant_id,
             entityType: 'PAYMENT_SESSION',
             entityId: recentSuccessSession.id,
@@ -886,23 +894,23 @@ export class AttributionEngine {
     // Tier 3: Late Observation Handling
     // Check if observation matches a recently expired or failed session on this receiving account (< 30 mins)
     const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
-    const recentExpired = this.sessionRepo.findRecentlyExpiredOrFailed(
+    const recentExpired = yield this.sessionRepo.findRecentlyExpiredOrFailed(
       normalizedObs.receivingAccountId,
       thirtyMinutesAgo
     );
 
     const lateMatches = recentExpired.filter(s => s.amountPaise === normalizedObs.amountPaise);
     if (lateMatches.length > 1) {
-      return this.holdAmbiguous(savedObs, lateMatches, 'MULTIPLE_LATE_AMOUNT_MATCHES');
+      return yield this.holdAmbiguous(savedObs, lateMatches, 'MULTIPLE_LATE_AMOUNT_MATCHES');
     }
     const lateMatchedSession = lateMatches[0];
 
     if (lateMatchedSession) {
       // Mark observation as LATE_UNMATCHED
-      this.obsRepo.markLateUnmatched(savedObs.id);
+      yield this.obsRepo.markLateUnmatched(savedObs.id);
 
       if (this.auditRepo) {
-        this.auditRepo.log({
+        yield this.auditRepo.log({
           merchantId: lateMatchedSession.merchantId,
           entityType: 'PAYMENT_SESSION',
           entityId: lateMatchedSession.id,
@@ -919,7 +927,7 @@ export class AttributionEngine {
 
       // Automatically create a high-priority reconciliation support ticket if customer exists
       if (this.ticketRepo && lateMatchedSession.customerId) {
-        this.ticketRepo.createTicket({
+        yield this.ticketRepo.createTicket({
           merchantId: lateMatchedSession.merchantId,
           customerId: lateMatchedSession.customerId,
           paymentId: lateMatchedSession.id,
@@ -960,5 +968,6 @@ export class AttributionEngine {
       observationId: savedObs.id,
       outcomeStatus: ObservationAttributionStatus.UNATTRIBUTED
     };
+    }.bind(this));
   }
 }

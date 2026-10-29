@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { ObservationAttributionStatus } from '@youpi/common';
+import { mapMaybe } from '../maybe.js';
 
 export class ObservationRepository {
   /**
@@ -22,7 +23,7 @@ export class ObservationRepository {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    this.db.execute(sql, [
+    return mapMaybe(this.db.execute(sql, [
       id,
       data.receivingAccountId,
       data.source,
@@ -36,82 +37,66 @@ export class ObservationRepository {
       data.attributionStatus || ObservationAttributionStatus.UNATTRIBUTED,
       data.attributedPaymentId || null,
       now
-    ]);
-
-    return this.findById(id);
+    ]), () => this.findById(id));
   }
 
   findById(id) {
-    const row = this.db.queryOne('SELECT * FROM payment_observations WHERE id = ?', [id]);
-    if (!row) return null;
-    return this.mapRow(row);
+    return mapMaybe(this.db.queryOne('SELECT * FROM payment_observations WHERE id = ?', [id]), row => row ? this.mapRow(row) : null);
   }
 
   findByFingerprint(fingerprintHash) {
-    const row = this.db.queryOne('SELECT * FROM payment_observations WHERE fingerprint_hash = ?', [fingerprintHash]);
-    if (!row) return null;
-    return this.mapRow(row);
+    return mapMaybe(this.db.queryOne('SELECT * FROM payment_observations WHERE fingerprint_hash = ?', [fingerprintHash]), row => row ? this.mapRow(row) : null);
   }
 
   findUnattributed(receivingAccountId) {
-    const rows = this.db.query(`
+    return mapMaybe(this.db.query(`
       SELECT * FROM payment_observations
       WHERE receiving_account_id = ? AND attribution_status = ?
       ORDER BY observed_at ASC
-    `, [receivingAccountId, ObservationAttributionStatus.UNATTRIBUTED]);
-
-    return rows.map(r => this.mapRow(r));
+    `, [receivingAccountId, ObservationAttributionStatus.UNATTRIBUTED]),
+    rows => rows.map(r => this.mapRow(r)));
   }
 
   findByReceivingAccount(receivingAccountId, limit = 50) {
-    const rows = this.db.query(`
+    return mapMaybe(this.db.query(`
       SELECT * FROM payment_observations
       WHERE receiving_account_id = ?
       ORDER BY observed_at DESC
       LIMIT ?
-    `, [receivingAccountId, limit]);
-
-    return rows.map(r => this.mapRow(r));
+    `, [receivingAccountId, limit]),
+    rows => rows.map(r => this.mapRow(r)));
   }
 
   markAttributed(id, paymentId) {
-    this.db.execute(`
+    return mapMaybe(this.db.execute(`
       UPDATE payment_observations
       SET attribution_status = ?, attributed_payment_id = ?
       WHERE id = ?
-    `, [ObservationAttributionStatus.ATTRIBUTED, paymentId, id]);
-
-    return this.findById(id);
+    `, [ObservationAttributionStatus.ATTRIBUTED, paymentId, id]), () => this.findById(id));
   }
 
   markDuplicate(id) {
-    this.db.execute(`
+    return mapMaybe(this.db.execute(`
       UPDATE payment_observations
       SET attribution_status = ?
       WHERE id = ?
-    `, [ObservationAttributionStatus.DUPLICATE_IGNORED, id]);
-
-    return this.findById(id);
+    `, [ObservationAttributionStatus.DUPLICATE_IGNORED, id]), () => this.findById(id));
   }
 
   markAmbiguous(id) {
-    this.db.execute(`
+    return mapMaybe(this.db.execute(`
       UPDATE payment_observations
       SET attribution_status = ?
       WHERE id = ?
-    `, [ObservationAttributionStatus.AMBIGUOUS, id]);
-
-    return this.findById(id);
+    `, [ObservationAttributionStatus.AMBIGUOUS, id]), () => this.findById(id));
   }
 
   markLateUnmatched(id) {
-    this.db.execute(`
+    return mapMaybe(this.db.execute(`
       UPDATE payment_observations
       SET attribution_status = ?
       WHERE id = ?
-    `, [ObservationAttributionStatus.LATE_UNMATCHED, id]);
-
-    return this.findById(id);
+    `, [ObservationAttributionStatus.LATE_UNMATCHED, id]), () => this.findById(id));
   }
 
   mapRow(row) {

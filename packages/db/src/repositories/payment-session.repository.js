@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { PaymentStatus, PaymentMethod, isValidTransition, TERMINAL_STATES, IMMUTABLE_STATES } from '@youpi/common';
+import { mapMaybe, runMaybe } from '../maybe.js';
 
 export class PaymentSessionRepository {
   /**
@@ -24,7 +25,7 @@ export class PaymentSessionRepository {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', 'UNVERIFIED', ?, ?, ?)
     `;
 
-    this.db.execute(sql, [
+    return mapMaybe(this.db.execute(sql, [
       id,
       data.merchantId,
       data.customerId || null,
@@ -42,43 +43,35 @@ export class PaymentSessionRepository {
       metadata,
       now,
       now
-    ]);
-
-    return this.findById(id);
+    ]), () => this.findById(id));
   }
 
   findById(id) {
-    const row = this.db.queryOne('SELECT * FROM payment_sessions WHERE id = ?', [id]);
-    if (!row) return null;
-    return this.mapRow(row);
+    return mapMaybe(this.db.queryOne('SELECT * FROM payment_sessions WHERE id = ?', [id]), row => row ? this.mapRow(row) : null);
   }
 
   findByOrderId(merchantId, orderId) {
     // The schema allows a second row for the same (merchant, order) once the previous one
     // is terminal, so the newest row must win. Without an explicit ordering a stale
     // terminal row could be returned and the caller would miss a SUCCESS session.
-    const row = this.db.queryOne(
+    return mapMaybe(this.db.queryOne(
       'SELECT * FROM payment_sessions WHERE merchant_id = ? AND order_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1',
       [merchantId, orderId]
-    );
-    if (!row) return null;
-    return this.mapRow(row);
+    ), row => row ? this.mapRow(row) : null);
   }
 
   findByCustomerId(customerId) {
-    const rows = this.db.query(
+    return mapMaybe(this.db.query(
       'SELECT * FROM payment_sessions WHERE customer_id = ? ORDER BY created_at DESC',
       [customerId]
-    );
-    return rows.map(r => this.mapRow(r));
+    ), rows => rows.map(r => this.mapRow(r)));
   }
 
   findByMerchantId(merchantId, limit = 50) {
-    const rows = this.db.query(
+    return mapMaybe(this.db.query(
       'SELECT * FROM payment_sessions WHERE merchant_id = ? ORDER BY created_at DESC LIMIT ?',
       [merchantId, limit]
-    );
-    return rows.map(r => this.mapRow(r));
+    ), rows => rows.map(r => this.mapRow(r)));
   }
 
   /**
@@ -93,116 +86,107 @@ export class PaymentSessionRepository {
     }
 
     const runAcquisition = () => {
-      return this.db.transaction(() => {
-      const now = new Date();
-      const nowIso = now.toISOString();
+      const repository = this;
+      return this.db.transaction(() => runMaybe(function* () {
+        const now = new Date();
+        const nowIso = now.toISOString();
 
-      // Check for current active or processing session on this receiving account
-      let activeRow = this.db.queryOne(`
-        SELECT id, status, expires_at, processing_expires_at
-        FROM payment_sessions
-        WHERE receiving_account_id = ? AND status IN (?, ?)
-        LIMIT 1
-      `, [receivingAccountId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING]);
+        let activeRow = yield repository.db.queryOne(`
+          SELECT id, status, expires_at, processing_expires_at
+          FROM payment_sessions
+          WHERE receiving_account_id = ? AND status IN (?, ?)
+          LIMIT 1
+        `, [receivingAccountId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING]);
 
-      if (activeRow) {
-        const isStale = (activeRow.status === PaymentStatus.ACTIVE && activeRow.expires_at && new Date(activeRow.expires_at) <= now) ||
-          (activeRow.status === PaymentStatus.PROCESSING && activeRow.processing_expires_at && new Date(activeRow.processing_expires_at) <= now);
-        if (isStale) {
-          const terminalStatus = activeRow.status === PaymentStatus.PROCESSING ? PaymentStatus.FAILED : PaymentStatus.EXPIRED;
-          if (!isValidTransition(activeRow.status, terminalStatus)) {
-            throw new Error(`Illegal payment state transition: cannot move from '${activeRow.status}' to '${terminalStatus}'.`);
+        if (activeRow) {
+          const isStale = (activeRow.status === PaymentStatus.ACTIVE && activeRow.expires_at && new Date(activeRow.expires_at) <= now) ||
+            (activeRow.status === PaymentStatus.PROCESSING && activeRow.processing_expires_at && new Date(activeRow.processing_expires_at) <= now);
+          if (isStale) {
+            const terminalStatus = activeRow.status === PaymentStatus.PROCESSING ? PaymentStatus.FAILED : PaymentStatus.EXPIRED;
+            if (!isValidTransition(activeRow.status, terminalStatus)) {
+              throw new Error(`Illegal payment state transition: cannot move from '${activeRow.status}' to '${terminalStatus}'.`);
+            }
+            yield repository.db.execute(`
+              UPDATE payment_sessions
+              SET status = ?, completed_at = ?, updated_at = ?
+              WHERE id = ?
+            `, [terminalStatus, nowIso, nowIso, activeRow.id]);
+            activeRow = null;
           }
-          this.db.execute(`
-            UPDATE payment_sessions
-            SET status = ?, completed_at = ?, updated_at = ?
-            WHERE id = ?
-          `, [terminalStatus, nowIso, nowIso, activeRow.id]);
-          activeRow = null;
-        }
-      }
-
-      // CRITICAL GUARD: If activeRow is THIS session itself, it's ALREADY ACTIVE! Do not demote to QUEUED!
-      if (activeRow && activeRow.id === sessionId) {
-        return {
-          status: PaymentStatus.ACTIVE,
-          queuePosition: 0,
-          expiresAt: activeRow.expires_at ? new Date(activeRow.expires_at) : new Date(now.getTime() + durationMs)
-        };
-      }
-
-      if (!activeRow) {
-        // Slot is vacant! Grant ACTIVE slot.
-        // Enforce the transition graph: a terminal or PROCESSING session must never be
-        // revived to ACTIVE by a concurrent queue tick.
-        const currentStatus = this.findById(sessionId)?.status;
-        if (currentStatus && !isValidTransition(currentStatus, PaymentStatus.ACTIVE)) {
-          throw new Error(`Illegal payment state transition: cannot move from '${currentStatus}' to 'ACTIVE'.`);
         }
 
-        const expiresAt = new Date(now.getTime() + durationMs).toISOString();
-
-        try {
-          this.db.execute(`
-            UPDATE payment_sessions
-            SET status = ?, slot_acquired_at = ?, expires_at = ?, queue_position = 0, updated_at = ?
-            WHERE id = ?
-          `, [PaymentStatus.ACTIVE, nowIso, expiresAt, nowIso, sessionId]);
-
-          // Mark receiving account as busy
-          this.db.execute(`
-            UPDATE payment_receiving_accounts
-            SET is_slot_busy = 1, current_active_session_id = ?, updated_at = ?
-            WHERE id = ?
-          `, [sessionId, nowIso, receivingAccountId]);
-
+        if (activeRow && activeRow.id === sessionId) {
           return {
             status: PaymentStatus.ACTIVE,
             queuePosition: 0,
-            expiresAt: new Date(expiresAt)
+            expiresAt: activeRow.expires_at ? new Date(activeRow.expires_at) : new Date(now.getTime() + durationMs)
           };
-        } catch (slotErr) {
-          if (slotErr.message && (slotErr.message.includes('idx_one_slot_per_receiving_account') || slotErr.message.includes('idx_single_active_session') || slotErr.message.includes('UNIQUE constraint failed'))) {
-            activeRow = this.db.queryOne(`
-              SELECT id, status, expires_at FROM payment_sessions
-              WHERE receiving_account_id = ? AND status IN (?, ?) LIMIT 1
-            `, [receivingAccountId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING]);
-          } else {
-            throw slotErr;
+        }
+
+        if (!activeRow) {
+          const currentSession = yield repository.findById(sessionId);
+          const currentStatus = currentSession?.status;
+          if (currentStatus && !isValidTransition(currentStatus, PaymentStatus.ACTIVE)) {
+            throw new Error(`Illegal payment state transition: cannot move from '${currentStatus}' to 'ACTIVE'.`);
           }
+
+          const expiresAt = new Date(now.getTime() + durationMs).toISOString();
+          try {
+            yield repository.db.execute(`
+              UPDATE payment_sessions
+              SET status = ?, slot_acquired_at = ?, expires_at = ?, queue_position = 0, updated_at = ?
+              WHERE id = ?
+            `, [PaymentStatus.ACTIVE, nowIso, expiresAt, nowIso, sessionId]);
+            yield repository.db.execute(`
+              UPDATE payment_receiving_accounts
+              SET is_slot_busy = 1, current_active_session_id = ?, updated_at = ?
+              WHERE id = ?
+            `, [sessionId, nowIso, receivingAccountId]);
+            return {
+              status: PaymentStatus.ACTIVE,
+              queuePosition: 0,
+              expiresAt: new Date(expiresAt)
+            };
+          } catch (slotErr) {
+            if (slotErr.message && (slotErr.message.includes('idx_one_slot_per_receiving_account') || slotErr.message.includes('idx_single_active_session') || slotErr.message.includes('UNIQUE constraint failed'))) {
+              activeRow = yield repository.db.queryOne(`
+                SELECT id, status, expires_at FROM payment_sessions
+                WHERE receiving_account_id = ? AND status IN (?, ?) LIMIT 1
+              `, [receivingAccountId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING]);
+            } else {
+              throw slotErr;
+            }
+          }
+        } else {
+          const existingSession = yield repository.findById(sessionId);
+          let queuePosition = existingSession?.queuePosition;
+          if (!queuePosition || queuePosition <= 0) {
+            const posRow = yield repository.db.queryOne(`
+              SELECT COALESCE(MAX(queue_position), 0) + 1 AS next_pos
+              FROM payment_sessions
+              WHERE receiving_account_id = ? AND status = ?
+            `, [receivingAccountId, PaymentStatus.QUEUED]);
+            queuePosition = posRow ? posRow.next_pos : 1;
+          }
+
+          if (existingSession && existingSession.status !== PaymentStatus.QUEUED && !isValidTransition(existingSession.status, PaymentStatus.QUEUED)) {
+            throw new Error(`Illegal payment state transition: cannot move from '${existingSession.status}' to 'QUEUED'.`);
+          }
+
+          yield repository.db.execute(`
+            UPDATE payment_sessions
+            SET status = ?, queue_position = ?, updated_at = ?
+            WHERE id = ?
+          `, [PaymentStatus.QUEUED, queuePosition, nowIso, sessionId]);
+
+          return {
+            status: PaymentStatus.QUEUED,
+            queuePosition,
+            expiresAt: null
+          };
         }
-      } else {
-        // Slot is busy! Place in QUEUED
-        const existingSession = this.findById(sessionId);
-        let queuePosition = existingSession?.queuePosition;
-        if (!queuePosition || queuePosition <= 0) {
-          const posRow = this.db.queryOne(`
-            SELECT COALESCE(MAX(queue_position), 0) + 1 AS next_pos
-            FROM payment_sessions
-            WHERE receiving_account_id = ? AND status = ?
-          `, [receivingAccountId, PaymentStatus.QUEUED]);
-
-          queuePosition = posRow ? posRow.next_pos : 1;
-        }
-
-        if (existingSession && existingSession.status !== PaymentStatus.QUEUED && !isValidTransition(existingSession.status, PaymentStatus.QUEUED)) {
-          throw new Error(`Illegal payment state transition: cannot move from '${existingSession.status}' to 'QUEUED'.`);
-        }
-
-        this.db.execute(`
-          UPDATE payment_sessions
-          SET status = ?, queue_position = ?, updated_at = ?
-          WHERE id = ?
-        `, [PaymentStatus.QUEUED, queuePosition, nowIso, sessionId]);
-
-        return {
-          status: PaymentStatus.QUEUED,
-          queuePosition,
-          expiresAt: null
-        };
-      }
-    }, { mode: 'IMMEDIATE' });
-  };
+      }), { mode: 'IMMEDIATE' });
+    };
 
   return typeof this.db.withRetry === 'function'
     ? this.db.withRetry(runAcquisition)
@@ -214,15 +198,12 @@ export class PaymentSessionRepository {
    * Starts independent 30-second verification timer.
    */
   transitionToProcessing(sessionId, durationMs = 30000) {
-    return this.db.transaction(() => {
-      const session = this.findById(sessionId);
+    const repository = this;
+    return this.db.transaction(() => runMaybe(function* () {
+      const session = yield repository.findById(sessionId);
       if (!session) throw new Error(`Session not found: ${sessionId}`);
 
-      // Idempotency: if already processing, return existing
-      if (session.status === PaymentStatus.PROCESSING) {
-        return session;
-      }
-
+      if (session.status === PaymentStatus.PROCESSING) return session;
       if (session.status !== PaymentStatus.ACTIVE) {
         throw new Error(`Cannot transition to PROCESSING from status: ${session.status}`);
       }
@@ -230,15 +211,14 @@ export class PaymentSessionRepository {
       const now = new Date();
       const nowIso = now.toISOString();
       const processingExpiresAt = new Date(now.getTime() + durationMs).toISOString();
-
-      this.db.execute(`
+      yield repository.db.execute(`
         UPDATE payment_sessions
         SET status = ?, processing_started_at = ?, processing_expires_at = ?, updated_at = ?
         WHERE id = ? AND status = ?
       `, [PaymentStatus.PROCESSING, nowIso, processingExpiresAt, nowIso, sessionId, PaymentStatus.ACTIVE]);
 
-      return this.findById(sessionId);
-    });
+      return yield repository.findById(sessionId);
+    }));
   }
 
   /**
@@ -246,8 +226,9 @@ export class PaymentSessionRepository {
    * Atomically releases receiving account slot.
    */
   transitionToTerminal(sessionId, targetStatus, options = {}) {
-    return this.db.transaction(() => {
-      const session = this.findById(sessionId);
+    const repository = this;
+    return this.db.transaction(() => runMaybe(function* () {
+      const session = yield repository.findById(sessionId);
       if (!session) throw new Error(`Session not found: ${sessionId}`);
 
       // Immutable outcomes stay put. OBSERVED_SUCCESS and MANUAL_REVIEW may still
@@ -287,63 +268,50 @@ export class PaymentSessionRepository {
         metadata = { ...metadata, replacedBySessionId: options.replacedBySessionId };
       }
 
-      this.db.execute(`
+      yield repository.db.execute(`
         UPDATE payment_sessions
         SET status = ?, completed_at = ?, attributed_observation_id = ?, metadata = ?, updated_at = ?
         WHERE id = ?
       `, [targetStatus, completedAtIso, attributedObsId, JSON.stringify(metadata), now, sessionId]);
 
+      if ([PaymentStatus.SUCCESS, PaymentStatus.FAILED, PaymentStatus.EXPIRED, PaymentStatus.CANCELLED].includes(targetStatus)) {
+        yield repository.db.execute(`
+          INSERT OR IGNORE INTO payment_webhook_outbox (payment_id, event_type, created_at)
+          VALUES (?, ?, ?)
+        `, [sessionId, targetStatus, now]);
+      }
+
       // Release slot on receiving account if this session owned it
       if (session.receivingAccountId) {
-        this.db.execute(`
+        yield repository.db.execute(`
           UPDATE payment_receiving_accounts
           SET is_slot_busy = 0, current_active_session_id = NULL, updated_at = ?
           WHERE id = ? AND (current_active_session_id = ? OR current_active_session_id IS NULL)
         `, [now, session.receivingAccountId, sessionId]);
       }
 
-      return this.findById(sessionId);
-    });
+      return yield repository.findById(sessionId);
+    }));
   }
 
   findCurrentActiveOrProcessing(receivingAccountId) {
-    const row = this.db.queryOne(`
+    return this.mapActiveRowMaybe(this.db.queryOne(`
       SELECT * FROM payment_sessions
       WHERE receiving_account_id = ? AND status IN (?, ?)
       LIMIT 1
-    `, [receivingAccountId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING]);
-
-    if (!row) return null;
-    const now = new Date();
-    const isStale = (row.status === PaymentStatus.ACTIVE && row.expires_at && new Date(row.expires_at) <= now) ||
-      (row.status === PaymentStatus.PROCESSING && row.processing_expires_at && new Date(row.processing_expires_at) <= now);
-    if (isStale) {
-      const terminalStatus = row.status === PaymentStatus.PROCESSING ? PaymentStatus.FAILED : PaymentStatus.EXPIRED;
-      this.transitionToTerminal(row.id, terminalStatus);
-      return null;
-    }
-    return this.mapRow(row);
+    `, [receivingAccountId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING])
+    );
   }
 
   findCurrentActiveOrProcessingForMerchant(merchantId) {
     if (!merchantId) return null;
-    const row = this.db.queryOne(`
+    return this.mapActiveRowMaybe(this.db.queryOne(`
       SELECT * FROM payment_sessions
       WHERE merchant_id = ? AND status IN (?, ?)
       ORDER BY created_at DESC
       LIMIT 1
-    `, [merchantId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING]);
-
-    if (!row) return null;
-    const now = new Date();
-    const isStale = (row.status === PaymentStatus.ACTIVE && row.expires_at && new Date(row.expires_at) <= now) ||
-      (row.status === PaymentStatus.PROCESSING && row.processing_expires_at && new Date(row.processing_expires_at) <= now);
-    if (isStale) {
-      const terminalStatus = row.status === PaymentStatus.PROCESSING ? PaymentStatus.FAILED : PaymentStatus.EXPIRED;
-      this.transitionToTerminal(row.id, terminalStatus);
-      return null;
-    }
-    return this.mapRow(row);
+    `, [merchantId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING])
+    );
   }
 
   findActiveForCustomer(customerId, excludeSessionId = null) {
@@ -358,18 +326,7 @@ export class PaymentSessionRepository {
       params.push(excludeSessionId);
     }
     query += ` ORDER BY created_at DESC LIMIT 1 `;
-    const row = this.db.queryOne(query, params);
-
-    if (!row) return null;
-    const now = new Date();
-    const isStale = (row.status === PaymentStatus.ACTIVE && row.expires_at && new Date(row.expires_at) <= now) ||
-      (row.status === PaymentStatus.PROCESSING && row.processing_expires_at && new Date(row.processing_expires_at) <= now);
-    if (isStale) {
-      const terminalStatus = row.status === PaymentStatus.PROCESSING ? PaymentStatus.FAILED : PaymentStatus.EXPIRED;
-      this.transitionToTerminal(row.id, terminalStatus);
-      return null;
-    }
-    return this.mapRow(row);
+    return this.mapActiveRowMaybe(this.db.queryOne(query, params));
   }
 
   findActiveForDevice(deviceId, excludeSessionId = null) {
@@ -384,18 +341,7 @@ export class PaymentSessionRepository {
       params.push(excludeSessionId);
     }
     query += ` ORDER BY created_at DESC LIMIT 1 `;
-    const row = this.db.queryOne(query, params);
-
-    if (!row) return null;
-    const now = new Date();
-    const isStale = (row.status === PaymentStatus.ACTIVE && row.expires_at && new Date(row.expires_at) <= now) ||
-      (row.status === PaymentStatus.PROCESSING && row.processing_expires_at && new Date(row.processing_expires_at) <= now);
-    if (isStale) {
-      const terminalStatus = row.status === PaymentStatus.PROCESSING ? PaymentStatus.FAILED : PaymentStatus.EXPIRED;
-      this.transitionToTerminal(row.id, terminalStatus);
-      return null;
-    }
-    return this.mapRow(row);
+    return this.mapActiveRowMaybe(this.db.queryOne(query, params));
   }
 
   findConflictingActiveSession({ customerId = null, deviceId = null, excludeSessionId = null }) {
@@ -420,77 +366,78 @@ export class PaymentSessionRepository {
       params.push(deviceId);
     }
     query += ` ORDER BY created_at DESC LIMIT 1 `;
-    const row = this.db.queryOne(query, params);
+    return this.mapActiveRowMaybe(this.db.queryOne(query, params));
+  }
 
-    if (!row) return null;
-    const now = new Date();
-    const isStale = (row.status === PaymentStatus.ACTIVE && row.expires_at && new Date(row.expires_at) <= now) ||
-      (row.status === PaymentStatus.PROCESSING && row.processing_expires_at && new Date(row.processing_expires_at) <= now);
-    if (isStale) {
-      const terminalStatus = row.status === PaymentStatus.PROCESSING ? PaymentStatus.FAILED : PaymentStatus.EXPIRED;
-      this.transitionToTerminal(row.id, terminalStatus);
-      return null;
-    }
-    return this.mapRow(row);
+  mapActiveRowMaybe(rowResult) {
+    return mapMaybe(rowResult, row => {
+      if (!row) return null;
+      const now = new Date();
+      const isStale = (row.status === PaymentStatus.ACTIVE && row.expires_at && new Date(row.expires_at) <= now) ||
+        (row.status === PaymentStatus.PROCESSING && row.processing_expires_at && new Date(row.processing_expires_at) <= now);
+      if (isStale) {
+        const terminalStatus = row.status === PaymentStatus.PROCESSING ? PaymentStatus.FAILED : PaymentStatus.EXPIRED;
+        return mapMaybe(this.transitionToTerminal(row.id, terminalStatus), () => null);
+      }
+      return this.mapRow(row);
+    });
   }
 
   findAllActiveOrPendingForCustomer(customerId) {
     if (!customerId) return [];
-    const rows = this.db.query(`
+    return mapMaybe(this.db.query(`
       SELECT * FROM payment_sessions
       WHERE customer_id = ? AND status IN (?, ?, ?, ?)
       ORDER BY created_at DESC
-    `, [customerId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING, PaymentStatus.QUEUED, PaymentStatus.INITIATED]);
-    return rows.map(r => this.mapRow(r));
+    `, [customerId, PaymentStatus.ACTIVE, PaymentStatus.PROCESSING, PaymentStatus.QUEUED, PaymentStatus.INITIATED]),
+    rows => rows.map(r => this.mapRow(r)));
   }
 
   findQueuedSessions(receivingAccountId) {
-    const rows = this.db.query(`
+    return mapMaybe(this.db.query(`
       SELECT * FROM payment_sessions
       WHERE receiving_account_id = ? AND status = ?
       ORDER BY queue_position ASC, created_at ASC
-    `, [receivingAccountId, PaymentStatus.QUEUED]);
-
-    return rows.map(r => this.mapRow(r));
+    `, [receivingAccountId, PaymentStatus.QUEUED]),
+    rows => rows.map(r => this.mapRow(r)));
   }
 
   getNextQueuedSession(receivingAccountId) {
-    const row = this.db.queryOne(`
+    return mapMaybe(this.db.queryOne(`
       SELECT * FROM payment_sessions
       WHERE receiving_account_id = ? AND status = ?
       ORDER BY queue_position ASC, created_at ASC
       LIMIT 1
-    `, [receivingAccountId, PaymentStatus.QUEUED]);
-
-    if (!row) return null;
-    return this.mapRow(row);
+    `, [receivingAccountId, PaymentStatus.QUEUED]),
+    row => row ? this.mapRow(row) : null);
   }
 
   /**
    * Re-indexes remaining queued sessions after a promotion.
    */
   reindexQueue(receivingAccountId) {
-    const queued = this.findQueuedSessions(receivingAccountId);
-    let pos = 1;
-    for (const session of queued) {
-      this.db.execute(`
-        UPDATE payment_sessions SET queue_position = ?, updated_at = ?
-        WHERE id = ?
-      `, [pos++, new Date().toISOString(), session.id]);
-    }
+    const repository = this;
+    return runMaybe(function* () {
+      const queued = yield repository.findQueuedSessions(receivingAccountId);
+      let pos = 1;
+      for (const session of queued) {
+        yield repository.db.execute(`
+          UPDATE payment_sessions SET queue_position = ?, updated_at = ?
+          WHERE id = ?
+        `, [pos++, new Date().toISOString(), session.id]);
+      }
+    });
   }
 
   findRecentlyExpiredOrFailed(receivingAccountId, sinceDate) {
-    const rows = this.db.query(`
+    return mapMaybe(this.db.query(`
       SELECT * FROM payment_sessions
       WHERE receiving_account_id = ?
         AND status IN (?, ?, ?)
         AND updated_at >= ?
       ORDER BY updated_at DESC
       LIMIT 20
-    `, [receivingAccountId, PaymentStatus.EXPIRED, PaymentStatus.FAILED, PaymentStatus.CANCELLED, sinceDate.toISOString()]);
-
-    return rows.map(r => this.mapRow(r));
+    `, [receivingAccountId, PaymentStatus.EXPIRED, PaymentStatus.FAILED, PaymentStatus.CANCELLED, sinceDate.toISOString()]), rows => rows.map(r => this.mapRow(r)));
   }
 
   /**
@@ -503,8 +450,9 @@ export class PaymentSessionRepository {
    * @returns {{ session: any, level: number, sources: string[], tag: string, isFirstSuccess: boolean }}
    */
   recordVerificationSource(sessionId, source, observationId, options = {}) {
-    return this.db.transaction(() => {
-      const session = this.findById(sessionId);
+    const repository = this;
+    return this.db.transaction(() => runMaybe(function* () {
+      const session = yield repository.findById(sessionId);
       if (!session) throw new Error(`Payment session not found: ${sessionId}`);
 
       // A dead outcome is final. recordVerificationSource is called from the attribution engine
@@ -562,7 +510,7 @@ export class PaymentSessionRepository {
       }
       const now = new Date().toISOString();
 
-      this.db.execute(`
+      yield repository.db.execute(`
         UPDATE payment_sessions
         SET status = ?,
             verification_level = ?,
@@ -585,14 +533,14 @@ export class PaymentSessionRepository {
 
       // If this transition made it terminal SUCCESS, release slot on receiving account
       if (targetStatus === PaymentStatus.OBSERVED_SUCCESS && session.receivingAccountId) {
-        this.db.execute(`
+        yield repository.db.execute(`
           UPDATE payment_receiving_accounts
           SET is_slot_busy = 0, current_active_session_id = NULL, updated_at = ?
           WHERE id = ? AND current_active_session_id = ?
         `, [now, session.receivingAccountId, sessionId]);
       }
 
-      const updated = this.findById(sessionId);
+      const updated = yield repository.findById(sessionId);
       return {
         session: updated,
         level,
@@ -600,16 +548,15 @@ export class PaymentSessionRepository {
         tag,
         isFirstSuccess
       };
-    });
+    }));
   }
 
   bindDevice(sessionId, deviceId) {
     const now = new Date().toISOString();
-    this.db.execute(
+    return mapMaybe(this.db.execute(
       'UPDATE payment_sessions SET device_id = ?, updated_at = ? WHERE id = ?',
       [deviceId, now, sessionId]
-    );
-    return this.findById(sessionId);
+    ), () => this.findById(sessionId));
   }
 
   mapRow(row) {

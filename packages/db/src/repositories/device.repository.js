@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { blindIndex, blindIndexMatches, safeEqual, issueDeviceCredential, verifyDeviceCredential } from '@youpi/common';
+import { mapMaybe, runMaybe } from '../maybe.js';
 
 /** Namespace so device-token digests never collide with other blind indexes. */
 const INDEX_NS = 'devtok';
@@ -43,7 +44,7 @@ export class DeviceRepository {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    this.db.execute(sql, [
+    return mapMaybe(this.db.execute(sql, [
       id,
       data.customerId || null,
       data.publicKey,
@@ -60,12 +61,7 @@ export class DeviceRepository {
       status,
       now,
       now
-    ]);
-
-    // The plaintext token is returned here and only here: it is issued to the registering
-    // client once. Persisted storage keeps only the keyed blind index.
-    const created = this.findById(id);
-    return created ? { ...created, deviceToken } : null;
+    ]), () => mapMaybe(this.findById(id), created => created ? { ...created, deviceToken } : null));
   }
 
   /**
@@ -74,8 +70,7 @@ export class DeviceRepository {
    */
   findById(id) {
     if (!id) return null;
-    const row = this.db.queryOne('SELECT * FROM devices WHERE id = ?', [id]);
-    return row ? this.mapRow(row) : null;
+    return mapMaybe(this.db.queryOne('SELECT * FROM devices WHERE id = ?', [id]), row => row ? this.mapRow(row) : null);
   }
 
   /**
@@ -88,32 +83,27 @@ export class DeviceRepository {
     if (!deviceId || typeof deviceId !== 'string' || !presentedToken || typeof presentedToken !== 'string') {
       return false;
     }
-    const row = this.db.queryOne(
-      'SELECT id, device_token, status FROM devices WHERE id = ?',
-      [deviceId]
-    );
-    if (!row || row.status !== 'ACTIVE' || !row.device_token) {
+    const repository = this;
+    return runMaybe(function* () {
+      const row = yield repository.db.queryOne(
+        'SELECT id, device_token, status FROM devices WHERE id = ?',
+        [deviceId]
+      );
+      if (!row || row.status !== 'ACTIVE' || !row.device_token) return false;
+
+      if (presentedToken.startsWith(`devtok_${deviceId}.`) && !verifyDeviceCredential(deviceId, presentedToken)) {
+        return false;
+      }
+      if (blindIndexMatches(presentedToken, row.device_token, INDEX_NS)) return true;
+
+      if (safeEqual(presentedToken, row.device_token)) {
+        try {
+          yield repository.db.execute('UPDATE devices SET device_token = ? WHERE id = ?', [blindIndex(presentedToken, INDEX_NS), row.id]);
+        } catch {}
+        return true;
+      }
       return false;
-    }
-
-    // If token uses the server-signed envelope (`devtok_<deviceId>...`), verify its HMAC signature too.
-    if (presentedToken.startsWith(`devtok_${deviceId}.`) && !verifyDeviceCredential(deviceId, presentedToken)) {
-      return false;
-    }
-
-    if (blindIndexMatches(presentedToken, row.device_token, INDEX_NS)) {
-      return true;
-    }
-
-    // Support legacy rows that stored the raw token prior to blind indexing, and upgrade them.
-    if (safeEqual(presentedToken, row.device_token)) {
-      try {
-        this.db.execute('UPDATE devices SET device_token = ? WHERE id = ?', [blindIndex(presentedToken, INDEX_NS), row.id]);
-      } catch {}
-      return true;
-    }
-
-    return false;
+    });
   }
 
   /**
@@ -123,15 +113,18 @@ export class DeviceRepository {
    */
   rotateToken(deviceId) {
     if (!deviceId) return null;
-    const row = this.db.queryOne('SELECT id, status FROM devices WHERE id = ?', [deviceId]);
-    if (!row || row.status !== 'ACTIVE') return null;
-    const freshToken = issueDeviceCredential(deviceId);
-    const now = new Date().toISOString();
-    this.db.execute(
-      'UPDATE devices SET device_token = ?, last_seen_at = ? WHERE id = ?',
-      [blindIndex(freshToken, INDEX_NS), now, deviceId]
-    );
-    return freshToken;
+    const repository = this;
+    return runMaybe(function* () {
+      const row = yield repository.db.queryOne('SELECT id, status FROM devices WHERE id = ?', [deviceId]);
+      if (!row || row.status !== 'ACTIVE') return null;
+      const freshToken = issueDeviceCredential(deviceId);
+      const now = new Date().toISOString();
+      yield repository.db.execute(
+        'UPDATE devices SET device_token = ?, last_seen_at = ? WHERE id = ?',
+        [blindIndex(freshToken, INDEX_NS), now, deviceId]
+      );
+      return freshToken;
+    });
   }
 
   /**
@@ -140,24 +133,26 @@ export class DeviceRepository {
    */
   findByToken(token) {
     if (!token) return null;
-    let row = this.db.queryOne(
-      'SELECT * FROM devices WHERE device_token = ? AND status = ?',
-      [blindIndex(token, INDEX_NS), 'ACTIVE']
-    );
-    // Rows written before index-only storage held the raw token; re-index on first use.
-    if (!row && typeof token === 'string' && token.startsWith('devtok_')) {
-      const legacy = this.db.queryOne(
+    const repository = this;
+    return runMaybe(function* () {
+      let row = yield repository.db.queryOne(
         'SELECT * FROM devices WHERE device_token = ? AND status = ?',
-        [token, 'ACTIVE']
+        [blindIndex(token, INDEX_NS), 'ACTIVE']
       );
-      if (legacy) {
-        try {
-          this.db.execute('UPDATE devices SET device_token = ? WHERE id = ?', [blindIndex(token, INDEX_NS), legacy.id]);
-        } catch {}
-        row = legacy;
+      if (!row && typeof token === 'string' && token.startsWith('devtok_')) {
+        const legacy = yield repository.db.queryOne(
+          'SELECT * FROM devices WHERE device_token = ? AND status = ?',
+          [token, 'ACTIVE']
+        );
+        if (legacy) {
+          try {
+            yield repository.db.execute('UPDATE devices SET device_token = ? WHERE id = ?', [blindIndex(token, INDEX_NS), legacy.id]);
+          } catch {}
+          row = legacy;
+        }
       }
-    }
-    return row ? this.mapRow(row) : null;
+      return row ? repository.mapRow(row) : null;
+    });
   }
 
   /**
@@ -166,8 +161,7 @@ export class DeviceRepository {
    */
   findByPublicKey(publicKey) {
     if (!publicKey) return null;
-    const row = this.db.queryOne('SELECT * FROM devices WHERE public_key = ? LIMIT 1', [publicKey]);
-    return row ? this.mapRow(row) : null;
+    return mapMaybe(this.db.queryOne('SELECT * FROM devices WHERE public_key = ? LIMIT 1', [publicKey]), row => row ? this.mapRow(row) : null);
   }
 
   /**
@@ -177,11 +171,10 @@ export class DeviceRepository {
    */
   findByCustomerAndFingerprint(customerId, fingerprintHash) {
     if (!customerId || !fingerprintHash) return null;
-    const row = this.db.queryOne(
+    return mapMaybe(this.db.queryOne(
       'SELECT * FROM devices WHERE customer_id = ? AND fingerprint_hash = ? AND status = "ACTIVE" LIMIT 1',
       [customerId, fingerprintHash]
-    );
-    return row ? this.mapRow(row) : null;
+    ), row => row ? this.mapRow(row) : null);
   }
 
   /**
@@ -190,11 +183,10 @@ export class DeviceRepository {
    */
   findByCustomerId(customerId) {
     if (!customerId) return [];
-    const rows = this.db.query(
+    return mapMaybe(this.db.query(
       'SELECT * FROM devices WHERE customer_id = ? ORDER BY last_seen_at DESC',
       [customerId]
-    );
-    return rows.map(r => this.mapRow(r));
+    ), rows => rows.map(r => this.mapRow(r)));
   }
 
   /**
@@ -204,11 +196,10 @@ export class DeviceRepository {
    */
   associateCustomer(deviceId, customerId) {
     const now = new Date().toISOString();
-    this.db.execute(
+    return mapMaybe(this.db.execute(
       'UPDATE devices SET customer_id = ?, last_seen_at = ? WHERE id = ?',
       [customerId, now, deviceId]
-    );
-    return this.findById(deviceId);
+    ), () => this.findById(deviceId));
   }
 
   /**
@@ -218,10 +209,11 @@ export class DeviceRepository {
   touch(deviceId) {
     if (!deviceId) return;
     try {
-      this.db.execute(
+      const result = this.db.execute(
         'UPDATE devices SET last_seen_at = ? WHERE id = ?',
         [new Date().toISOString(), deviceId]
       );
+      if (result && typeof result.then === 'function') return result.catch(() => undefined);
     } catch {}
   }
 
@@ -255,8 +247,7 @@ export class DeviceRepository {
     values.push(new Date().toISOString());
 
     values.push(id);
-    this.db.execute(`UPDATE devices SET ${fields.join(', ')} WHERE id = ?`, values);
-    return this.findById(id);
+    return mapMaybe(this.db.execute(`UPDATE devices SET ${fields.join(', ')} WHERE id = ?`, values), () => this.findById(id));
   }
 
   /**
