@@ -22,14 +22,14 @@
        One radius scale (6 controls / 10 surfaces / 4 tags). */
     @font-face {
       font-family: "DM Sans";
-      src: url("/fonts/dm-sans.woff2") format("woff2");
+      src: url("{{ADMIN_BASE_PATH}}/fonts/dm-sans.woff2") format("woff2");
       font-weight: 100 1000;
       font-display: swap;
     }
 
     @font-face {
       font-family: "Sora";
-      src: url("/fonts/sora.woff2") format("woff2");
+      src: url("{{ADMIN_BASE_PATH}}/fonts/sora.woff2") format("woff2");
       font-weight: 100 800;
       font-display: swap;
     }
@@ -1173,6 +1173,19 @@
       .cashier-modal-card {
         width: 100%;
       }
+
+      :is(#subViewOpsObservers, #subViewStoreBrand, #subViewDevCloudflare, #subViewDevProtocols) {
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+
+      :is(#subViewOpsObservers, #subViewStoreBrand, #subViewDevCloudflare, #subViewDevProtocols) [style*="grid-template-columns"] {
+        grid-template-columns: minmax(0, 1fr) !important;
+      }
+
+      :is(#subViewOpsObservers, #subViewStoreBrand, #subViewDevCloudflare, #subViewDevProtocols) [style*="grid-template-columns"] > * {
+        min-width: 0;
+      }
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -1243,7 +1256,7 @@
       <!-- Live Polling Indicator -->
       <div class="live-pulse-badge">
         <div class="pulse-dot"></div>
-        <span>Live Syncing</span>
+        <span id="adminSyncStatus">Connecting</span>
       </div>
     </div>
   </header>
@@ -3697,7 +3710,7 @@
         </div>
         <div style="display:flex; justify-content:flex-end; gap:0.75rem; border-top:1px solid var(--border); padding-top:1rem;">
           <button type="button" class="btn btn-secondary" onclick="closeNewMerchantModal()">Cancel</button>
-          <button type="button" class="btn btn-primary" onclick="submitNewMerchant()">Create Merchant</button>
+          <button type="button" class="btn btn-primary" id="createMerchantButton" onclick="submitNewMerchant()">Create Merchant</button>
         </div>
       </div>
     </div>
@@ -3789,9 +3802,13 @@
     // --- Admin API authentication ---------------------------------------------------------
     // /api/v1/admin/* requires the admin token (ADMIN_API_TOKEN, or the generated file
     // data/.secrets/admin_api_token on the server). It is kept in sessionStorage for this tab only.
+    const IS_SERVERLESS = '{{SERVERLESS_HOST}}' === 'true';
+    const ADMIN_BASE_PATH = '{{ADMIN_BASE_PATH}}';
     window.__youpiAdminAuth = (function () {
       const KEY = 'youpi_admin_token';
       const nativeFetch = window.fetch.bind(window);
+      const activeReads = new Map();
+      let failures = 0;
       let pending = null;
 
       const read = () => { try { return sessionStorage.getItem(KEY) || ''; } catch (e) { return ''; } };
@@ -3799,7 +3816,7 @@
       const clear = () => { try { sessionStorage.removeItem(KEY); } catch (e) {} };
 
       function isProtected(url) {
-        return (/\/api\/v1\/admin\//.test(url) || /\/api\/services/.test(url) || /\/api\/admin\/tickets/.test(url)) && !/\/admin\/sms-gateway\/download-apk/.test(url);
+        return (/\/api\/v1\/admin\//.test(url) || /\/api\/services/.test(url) || /\/api\/logs\/stream/.test(url) || /\/api\/admin\/tickets/.test(url)) && !/\/admin\/sms-gateway\/download-apk/.test(url);
       }
 
       function prompt(message) {
@@ -3839,32 +3856,55 @@
         return pending;
       }
 
-      async function authedFetch(input, init) {
+      async function authenticatedRequest(input, init) {
         const url = typeof input === 'string' ? input : (input && input.url) || '';
         if (!isProtected(url)) return nativeFetch(input, init);
         if (!read()) {
           await prompt();
-          if (typeof connectAdminEventsSse === 'function') connectAdminEventsSse();
-          if (typeof connectServicesLogsSse === 'function') connectServicesLogsSse();
         }
+        let attemptedToken;
         const attempt = () => {
+          attemptedToken = read();
           const headers = new Headers((init && init.headers) || (input && input.headers) || {});
-          headers.set('Authorization', 'Bearer ' + read());
-          return nativeFetch(input, Object.assign({}, init, { headers }));
+          headers.set('Authorization', 'Bearer ' + attemptedToken);
+          const options = Object.assign({}, init, { headers });
+          if (headers.get('Accept') !== 'text/event-stream') {
+            const signal = options.signal || (input && input.signal);
+            const timeout = AbortSignal.timeout(15000);
+            options.signal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+          }
+          return nativeFetch(input, options).catch(error => { failures++; throw error; });
         };
         let res = await attempt();
         if (res.status === 401) {
-          clear();
-          await prompt('That token was rejected. Enter the admin API token again.');
+          if (read() === attemptedToken) clear();
+          if (!read()) await prompt('That token was rejected. Enter the admin API token again.');
           res = await attempt();
-          if (res.ok && typeof connectAdminEventsSse === 'function') connectAdminEventsSse();
-          if (res.ok && typeof connectServicesLogsSse === 'function') connectServicesLogsSse();
         }
+        if (!res.ok) failures++;
         return res;
       }
 
+      function authedFetch(input, init) {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+        const headers = new Headers((init && init.headers) || (input && input.headers) || {});
+        if (!isProtected(url) || method !== 'GET' || headers.get('Accept') === 'text/event-stream') {
+          return authenticatedRequest(input, init);
+        }
+        const key = JSON.stringify([url, Array.from(headers.entries())]);
+        let request = activeReads.get(key);
+        if (!request) {
+          request = authenticatedRequest(input, init);
+          activeReads.set(key, request);
+          const cleanup = () => { if (activeReads.get(key) === request) activeReads.delete(key); };
+          request.then(cleanup, cleanup);
+        }
+        return request.then(response => response.clone());
+      }
+
       window.fetch = authedFetch;
-      return { token: read, ensure: () => (read() ? Promise.resolve() : prompt()) };
+      return { token: read, ensure: () => (read() ? Promise.resolve() : prompt()), failures: () => failures };
     })();
 
     const API_BASE = "{{API_BASE_URL}}";
@@ -3875,8 +3915,7 @@
     let currentMerchantId = '00000000-0000-0000-0000-000000000001';
     let currentMerchantBranding = {};
     let settingsLoaded = false;
-    let pollingTimer = null;
-    let waPollingTimer = null;
+    let adminPolling = null;
     let servicesLogsSse = null;
     let activeSection = 'operations';
     let activeSubTab = 'subViewOpsLive';
@@ -3988,18 +4027,6 @@
       // Render sub-navigation bar
       renderSubNavBar(sectionId, targetSubTab);
 
-      // Initial triggers
-      if (sectionId === 'operations') {
-        fetchLiveData();
-      } else if (sectionId === 'storeSettings') {
-        if (!settingsLoaded) fetchGatewaySettings();
-      } else if (sectionId === 'developerHub') {
-        loadServices();
-        connectServicesLogsSse();
-        fetchTunnelStatus();
-      } else if (sectionId === 'security') {
-        fetchBannedUsers();
-      }
     }
 
     function renderSubNavBar(sectionId, targetSubTab = null) {
@@ -4041,6 +4068,7 @@
       items.forEach(item => {
         const btn = document.createElement('button');
         btn.className = `sub-nav-pill ${item.id === defaultSub ? 'active' : ''}`;
+        btn.dataset.viewId = item.id;
         btn.textContent = item.label;
         btn.onclick = () => switchSubView(sectionId, item.id);
         subNav.appendChild(btn);
@@ -4055,7 +4083,7 @@
       // Update pill styles
       document.querySelectorAll('.sub-nav-pill').forEach(p => {
         p.classList.remove('active');
-        if (p.onclick.toString().includes(subViewId)) p.classList.add('active');
+        if (p.dataset.viewId === subViewId) p.classList.add('active');
       });
 
       // Hide all sub-views in current section and show target
@@ -4073,33 +4101,21 @@
       if (subViewId === 'subViewDevSimulator') {
         initPaymentSimulator();
       }
-      if (subViewId === 'subViewOpsCounter') {
-        if (currentSellingMode === 'ONLINE') fetchCodOrders();
-        else fetchCounterPayments();
-      }
-      if (subViewId === 'subViewOpsTransactions') fetchPaymentsLedger();
-      if (subViewId === 'subViewOpsObservers') fetchObserversStatus();
-      if (subViewId === 'subViewDevAndroid') {
-        fetchObserversStatus();
-        fetchSmsPairQr();
-      }
       if (subViewId === 'subViewDevProtocols') {
-        fetchWhatsAppStatus();
         fetchGmailCredentials();
       }
-      if (subViewId === 'subViewDevSupervisor') {
-        loadServices();
-        fetchFalseNarrativeStatus();
+      adminPolling?.refresh();
+      if (subViewId !== 'subViewDevSupervisor' && servicesLogsSse) {
+        servicesLogsSse.close();
+        servicesLogsSse = null;
       }
-      if (subViewId === 'subViewSecBanned') fetchBannedUsers();
-      if (subViewId === 'subViewSecEvents') fetchSecurityEvents();
-      if (subViewId === 'subViewSecHistory') fetchSecurityHistory();
     }
 
     // --- MERGED CONTROL CENTER & SYSTEM SUPERVISOR ---
     async function loadServices() {
+      if (IS_SERVERLESS) return;
       try {
-        const res = await fetch('/api/services');
+        const res = await fetch(`${ADMIN_BASE_PATH}/api/services`);
         if (!res.ok) throw new Error('Supervisor unreachable');
         servicesList = await res.json();
         renderServicesTable(servicesList);
@@ -4332,6 +4348,7 @@
               emit(eventName, dataLines.join('\n'));
             }
           }
+          if (!closed) throw new Error('Event stream disconnected');
         } catch (err) {
           if (!closed) {
             if (typeof apiSse.onerror === 'function') { try { apiSse.onerror(err); } catch (e) { } }
@@ -4363,12 +4380,13 @@
     }
 
     function connectServicesLogsSse() {
+      if (IS_SERVERLESS || document.hidden || activeSubTab !== 'subViewDevSupervisor') return;
       if (servicesLogsSse) return;
       const token = window.__youpiAdminAuth ? window.__youpiAdminAuth.token() : '';
       if (!token) return;
       try {
         servicesLogsSse = openAuthenticatedEventStream(
-          '/api/logs/stream',
+          `${ADMIN_BASE_PATH}/api/logs/stream`,
           token,
           (eventName, data) => {
             if (eventName === 'log') {
@@ -4380,7 +4398,6 @@
           () => {
             servicesLogsSse.close();
             servicesLogsSse = null;
-            setTimeout(connectServicesLogsSse, 5000);
           }
         );
       } catch (e) { }
@@ -4477,21 +4494,23 @@
       }
     }
 
-    // --- LIVE AUTO-POLLING (2.5s) ---
+    // --- LIVE MONITOR ---
     async function fetchLiveData() {
       try {
         const qRes = await fetch(`${API_BASE}/api/v1/admin/queue`);
+        if (!qRes.ok) return;
         const qData = await qRes.json();
         renderSlotActive(qData.currentSlot);
         renderSlotProcessing(qData.currentSlot);
         renderQueueTable(qData.queue || []);
 
         const pRes = await fetch(`${API_BASE}/api/v1/admin/payments`);
+        if (!pRes.ok) return;
         const pData = await pRes.json();
         updateKpis(pData.payments || [], qData.queue || []);
 
         if (activeSection === 'operations' && activeSubTab === 'subViewOpsCounter') {
-          if (currentSellingMode === 'ONLINE') fetchCodOrders();
+          if (currentSellingMode === 'ONLINE') await fetchCodOrders();
           else renderCounterDesk(pData.payments || []);
         }
       } catch (e) { }
@@ -5509,6 +5528,7 @@
 
     // --- CLOUDFLARE TUNNEL RUNNER ---
     async function fetchTunnelStatus() {
+      if (IS_SERVERLESS) return;
       try {
         const res = await fetch(`${API_BASE}/api/v1/admin/tunnel/status`);
         if (!res.ok) return;
@@ -5596,9 +5616,7 @@
 
     // --- ANDROID SMS OBSERVER FUNCTIONS ---
     async function fetchObserversStatus() {
-      fetchSmsGatewayDevices();
-      fetchSmsPairQr();
-      fetchGmailCredentials();
+      await Promise.all([fetchSmsGatewayDevices(), fetchSmsPairQr(), fetchGmailCredentials()]);
     }
 
     async function fetchSmsGatewayDevices() {
@@ -6140,6 +6158,7 @@
     }
 
     function connectAdminEventsSse() {
+      if (IS_SERVERLESS || document.hidden || window.__adminSse) return;
       try {
         const adminToken = window.__youpiAdminAuth.token();
         if (!adminToken) return; // reconnected right after the token is entered
@@ -6172,7 +6191,7 @@
         });
         adminSse.onerror = () => {
           adminSse.close();
-          setTimeout(connectAdminEventsSse, 3000);
+          if (window.__adminSse === adminSse) window.__adminSse = null;
         };
       } catch (e) { }
     }
@@ -7775,7 +7794,7 @@
       if (!merchantId || merchantId === currentMerchantId) return;
       currentMerchantId = merchantId;
       showAdminToast(`Switched store context.`, true);
-      await loadMerchantSettings();
+      await fetchGatewaySettings();
       renderMerchantCredentials();
     }
 
@@ -7830,7 +7849,10 @@
       }
     }
 
+    let creatingMerchant = false;
+
     async function submitNewMerchant() {
+      if (creatingMerchant) return;
       const name = document.getElementById('modalMerchantName')?.value?.trim();
       if (!name) {
         showAdminToast('Store / Business Name is required.', false);
@@ -7842,6 +7864,9 @@
       const contactPhone = document.getElementById('modalMerchantPhone')?.value?.trim() || '';
       const webhookUrl = document.getElementById('modalMerchantWebhook')?.value?.trim() || undefined;
 
+      creatingMerchant = true;
+      const button = document.getElementById('createMerchantButton');
+      if (button) { button.disabled = true; button.textContent = 'Creating...'; }
       try {
         const res = await fetch(`${API_BASE}/api/v1/admin/merchants`, {
           method: 'POST',
@@ -7859,10 +7884,13 @@
         await fetchMerchantsList();
         currentMerchantId = data.merchant.id;
         renderMerchantSelector();
-        await loadMerchantSettings();
+        await fetchGatewaySettings();
         renderMerchantCredentials(data.merchant);
       } catch (err) {
         showAdminToast(`Network error: ${err.message}`, false);
+      } finally {
+        creatingMerchant = false;
+        if (button) { button.disabled = false; button.textContent = 'Create Merchant'; }
       }
     }
 
@@ -7910,7 +7938,114 @@
       }
     }
 
+    function startAdminPolling(refresh, interval = 10000) {
+      let timer = null;
+      let running = false;
+      let stopped = false;
+      let requested = false;
+      let failures = 0;
+
+      const run = async () => {
+        clearTimeout(timer);
+        if (stopped || document.hidden) return;
+        if (running) { requested = true; return; }
+        running = true;
+        requested = false;
+        try {
+          await refresh();
+          failures = 0;
+        } catch (error) {
+          failures = Math.min(failures + 1, 4);
+        } finally {
+          running = false;
+          if (!stopped && !document.hidden) {
+            timer = setTimeout(run, requested ? 0 : interval * (2 ** failures));
+          }
+        }
+      };
+      const request = () => {
+        clearTimeout(timer);
+        if (running) { requested = true; return; }
+        if (!stopped && !document.hidden) timer = setTimeout(run, 0);
+      };
+      const visibilityChanged = () => {
+        clearTimeout(timer);
+        if (!document.hidden) request();
+      };
+      const stop = () => {
+        stopped = true;
+        clearTimeout(timer);
+        document.removeEventListener('visibilitychange', visibilityChanged);
+        window.removeEventListener('pagehide', stop);
+      };
+      document.addEventListener('visibilitychange', visibilityChanged);
+      window.addEventListener('pagehide', stop);
+      request();
+      return { refresh: request, stop };
+    }
+
+    async function refreshAdminView() {
+      await window.__youpiAdminAuth.ensure();
+      if (document.hidden) return;
+      const failures = window.__youpiAdminAuth.failures();
+      await pollGlobalCounterPending();
+      switch (activeSubTab) {
+        case 'subViewOpsLive': await fetchLiveData(); break;
+        case 'subViewOpsCounter':
+          if (currentSellingMode === 'ONLINE') await fetchCodOrders();
+          else await fetchCounterPayments();
+          break;
+        case 'subViewOpsTransactions': await fetchPaymentsLedger(); break;
+        case 'subViewOpsObservers':
+        case 'subViewDevAndroid': await fetchObserversStatus(); break;
+        case 'subViewStoreBrand':
+        case 'subViewStoreVpa':
+        case 'subViewStoreModes':
+        case 'subViewDevWebhooks':
+          if (!settingsLoaded) await fetchGatewaySettings();
+          break;
+        case 'subViewDevSimulator':
+          await fetchTestModeStatus();
+          await simCheckTestMode();
+          break;
+        case 'subViewDevProtocols': await fetchWhatsAppStatus(); break;
+        case 'subViewDevSupervisor':
+          if (!IS_SERVERLESS) {
+            await loadServices();
+            await fetchFalseNarrativeStatus();
+            connectServicesLogsSse();
+          }
+          break;
+        case 'subViewDevCloudflare': await fetchTunnelStatus(); break;
+        case 'subViewSecBanned': await fetchBannedUsers(); break;
+        case 'subViewSecEvents': await fetchSecurityEvents(); break;
+        case 'subViewSecHistory': await fetchSecurityHistory(); break;
+      }
+      if (!IS_SERVERLESS) connectAdminEventsSse();
+      const failed = window.__youpiAdminAuth.failures() !== failures;
+      const status = document.getElementById('adminSyncStatus');
+      if (status) status.textContent = failed ? 'Connection issue' : 'Connected';
+      if (failed) throw new Error('Admin refresh failed');
+    }
+
+    function closeAdminStreams() {
+      servicesLogsSse?.close();
+      servicesLogsSse = null;
+      window.__adminSse?.close();
+      window.__adminSse = null;
+    }
+
     // --- INITIALIZATION ---
+    if (IS_SERVERLESS) {
+      document.getElementById('headerStoreBadge').style.display = 'none';
+      document.getElementById('subViewDevSupervisor').innerHTML = '<p role="status">Process supervision requires a persistent Node.js host and is unavailable on Vercel.</p>';
+      for (const id of ['btnStartTunnel', 'btnStopTunnel']) {
+        const button = document.getElementById(id);
+        if (button) { button.disabled = true; button.title = 'Requires a persistent host'; }
+      }
+      const tunnelBadge = document.getElementById('tunnelStatusBadge');
+      if (tunnelBadge) tunnelBadge.textContent = 'Unavailable on Vercel';
+    }
     const validSections = ['operations', 'storeSettings', 'developerHub', 'security'];
     const hashSec = (window.location.hash || '').replace('#', '').trim();
     const searchSec = new URLSearchParams(window.location.search).get('section');
@@ -7924,25 +8059,23 @@
       }
     });
 
-    fetchMerchantsList();
-    fetchGatewaySettings();
-    fetchObserversStatus();
-    fetchWhatsAppStatus();
-    loadServices();
-    fetchFalseNarrativeStatus();
-    fetchTestModeStatus();
-    connectServicesLogsSse();
-    connectAdminEventsSse();
-    pollGlobalCounterPending();
-
-    pollingTimer = setInterval(fetchLiveData, 2500);
-    setInterval(pollGlobalCounterPending, 4000);
-    setInterval(fetchTunnelStatus, 4000);
-    setInterval(fetchWhatsAppStatus, 4000);
-    setInterval(fetchSmsGatewayDevices, 3500);
-    setInterval(loadServices, 5000);
-    setInterval(fetchFalseNarrativeStatus, 15000);
-    setInterval(fetchTestModeStatus, 15000);
+    async function initializeAdmin() {
+      await window.__youpiAdminAuth.ensure();
+      await fetchMerchantsList();
+      await fetchGatewaySettings();
+      adminPolling = startAdminPolling(refreshAdminView);
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) closeAdminStreams();
+    });
+    window.addEventListener('pagehide', closeAdminStreams);
+    window.addEventListener('pageshow', event => {
+      if (event.persisted) {
+        adminPolling?.stop();
+        adminPolling = startAdminPolling(refreshAdminView);
+      }
+    });
+    initializeAdmin();
   </script>
 
 </body>

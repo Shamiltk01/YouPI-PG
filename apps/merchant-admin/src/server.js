@@ -84,6 +84,8 @@ export class AdminServer {
     // This completely eliminates CORS errors, tunnel downtime 530s, and cross-origin failures.
     const clientApiBase = '';
     html = html.replaceAll('{{API_BASE_URL}}', clientApiBase);
+    html = html.replaceAll('{{SERVERLESS_HOST}}', process.env.VERCEL ? 'true' : 'false');
+    html = html.replaceAll('{{ADMIN_BASE_PATH}}', process.env.VERCEL ? '/admin' : '');
     html = html.replaceAll('{{APP_NAME}}', appName);
     html = html.replaceAll('{{DEFAULT_PRIMARY_COLOR}}', primaryColor);
     return html;
@@ -118,9 +120,9 @@ export class AdminServer {
           res.end(JSON.stringify({ error: 'Unauthorized', code: 'AUTH_REQUIRED' }));
           return;
         }
-        const merchants = this.merchantRepo.findAll();
+        const merchants = await this.merchantRepo.findAll();
         const mId = merchants[0]?.id || '00000000-0000-0000-0000-000000000001';
-        const tickets = this.ticketRepo.findTicketsByMerchant(mId);
+        const tickets = await this.ticketRepo.findTicketsByMerchant(mId);
 
         res.writeHead(200, {
           'Content-Type': 'application/json',
@@ -174,7 +176,7 @@ export class AdminServer {
       if (pathname.startsWith('/api/')) {
         const targetUrl = new URL(req.url, this.apiBaseUrl);
         const requestClient = targetUrl.protocol === 'https:' ? https : http;
-        const defaultMerchant = this.merchantRepo.getDefault ? this.merchantRepo.getDefault() : (this.merchantRepo.findById('00000000-0000-0000-0000-000000000001') || this.merchantRepo.findAll()[0]);
+        const defaultMerchant = await this.merchantRepo.getDefault();
         const defaultMerchantId = defaultMerchant?.id || '00000000-0000-0000-0000-000000000001';
         const proxyReq = requestClient.request({
           hostname: targetUrl.hostname,
